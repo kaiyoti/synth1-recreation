@@ -38,3 +38,8 @@ Computer keyboard: Z..M / Q..P rows play notes, `-` / `=` (or the octave buttons
 Colour tags (shown in Synth1's program list): red = drums & percussion, blue = bass,
 yellow = brass & winds, green = strings, choir & pads, cyan = guitars, plucked, keys & bells,
 magenta = synth leads & arps, default = SFX / unsorted.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Synth1 itself is the work of Ichiro Toda; this
+licence covers only this recreation (code, artwork and patch banks in this repo).
