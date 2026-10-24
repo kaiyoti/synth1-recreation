@@ -5,8 +5,8 @@ A browser recreation of **Synth1**, the classic free virtual-analog synthesizer 
 
 - `web/` — the playable synth: an editor with artwork drawn in code (no original bitmaps), an on-screen keyboard with pitch/mod wheels, Web MIDI input, and the sound engine
   compiled to WebAssembly.
-- `banks/` — the Kaiyoti sound library as Synth1 bank folders (`NNN.sy1`), usable in the original
-  plugin too.
+- `banks/` — Synth1 bank folders (`NNN.sy1`), usable in the original plugin too: `00 Factory` is
+  Synth1's stock bank, unchanged; 01–11 are the Kaiyoti sound library.
 
 ## Run it
 Any static web server works:
@@ -26,6 +26,7 @@ Computer keyboard: Z..M / Q..P rows play notes, `-` / `=` (or the octave buttons
 ## Banks
 | Bank | Contents |
 |---|---|
+| 00 | Factory: Synth1's stock bank (unchanged) |
 | 01–03 | Drums & Percussion (kicks, snares, toms, hats, cymbals, kits; taiko/timpani, shakers, tickers, metal, wood) |
 | 04 | Bass |
 | 05–06 | Brass & Winds (trumpets, French horns, trombones, tuba; flutes, reeds, pipes) |
@@ -42,4 +43,6 @@ magenta = synth leads & arps, default = SFX / unsorted.
 ## License
 
 MIT, see [LICENSE](LICENSE). Synth1 itself is the work of Ichiro Toda; this
-licence covers only this recreation (code, artwork and patch banks in this repo).
+licence covers only this recreation (code, artwork and patch banks 01–11). Bank 00 is the stock
+Synth1 factory bank, included unchanged; it belongs to its original authors and is not covered
+by the MIT licence.
