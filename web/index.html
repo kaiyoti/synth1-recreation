@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Synth1 panel (M4)</title>
+<link rel="stylesheet" href="keyboard.css?v=1792771200">
+<style>
+  html, body { margin: 0; background: #2b2b2b; color: #ddd; font: 13px system-ui, sans-serif; }
+  #page { display: flex; flex-wrap: wrap; align-items: flex-start; }
+  #bar { padding: 6px 10px; display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+  #stage { padding: 0; margin: 0; flex: none; }
+  canvas { display: block; image-rendering: crisp-edges; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<div id="page">
+<div id="stage"></div>
+<div id="bar">
+  <label>scale <select id="scale"><option>1</option><option selected>2</option><option>3</option></select></label>
+  <button id="audio" type="button">Enable audio</button>
+  <span>octave <button id="octdn" type="button" title="computer keyboard down an octave (-)">&#9664;</button>
+    <span id="octval" style="display:inline-block;min-width:2.6em;text-align:center">C4</span>
+    <button id="octup" type="button" title="computer keyboard up an octave (=)">&#9654;</button></span>
+  <label>.sy1 <input type="file" id="sy1" accept=".sy1"></label>
+  <span id="status"></span>
+</div>
+</div>
+<script src="engine_adapter.js?v=9"></script>
+<script src="keyboard.js?v=1792771200"></script>
+<script src="panel_core.js?v=1793100000"></script>
+<script src="panel_widgets.js?v=1792714610"></script>
+<script src="panel_popups.js?v=1792714610"></script>
+<script src="panel_select.js?v=1793200100"></script>
+<script src="panel_app.js?v=1793200000"></script>
+<script src="panel_opt.js?v=1792800000"></script>
+<script src="opt_ui.js?v=1792900000"></script>
+<script>
+(async function () {
+  const q = new URLSearchParams(location.search);
+  const scale = +(q.get('scale') || 2), dpr0 = window.devicePixelRatio || 1;
+  const scSel = document.getElementById('scale');
+  if (![...scSel.options].some((o) => o.value === String(scale))) scSel.add(new Option(String(scale), String(scale)));
+  scSel.value = String(scale);
+  document.getElementById('scale').onchange = (e) => { q.set('scale', e.target.value); location.search = q.toString(); };
+  const st = document.getElementById('status');
+  // default look = 'classic' (the original theme redrawn in code); ?skin=s80 = Nord colours
+  const skinQ = q.get('skin');
+  const skin = (skinQ && /^[a-z0-9_-]+$/i.test(skinQ)) ? skinQ : 'classic';
+  const have200 = await fetch((skin ? 'skins/' + skin + '/' : '') + 'assets200/panel_data.json', { method: 'HEAD' }).then((r) => r.ok).catch(() => false);
+  if (skin) document.documentElement.dataset.skin = skin;
+  const panel = await Synth1Panel.mount(document.getElementById('stage'), { scale: scale, have200: have200,
+    skin: skin,
+    onNote: (n, v) => { st.textContent = v ? 'note ' + n + ' vel ' + v : ''; },
+    // OPT is blocked in the web version for now (user 2026-10-23: MIDI mapping comes later);
+    // the dialog code stays (panel_opt.js / opt_ui.js) — re-enable by calling Synth1OptUI.open here
+    onOpt: () => { st.textContent = 'Options are not available in the web version yet'; } });
+  window.addEventListener('resize', () => { if (Math.abs((window.devicePixelRatio || 1) - dpr0) > 1e-6) location.reload(); });
+  window.panel = panel;
+  if (panel.banks) panel.loadProgram(0, 0);
+  else { const r = await fetch('assets/init_sy1.txt').catch(() => null); if (r && r.ok) panel.loadSy1(await r.text(), 0, '00:bank0  '); }
+  window.panelReady = true;
+  // computer-keyboard octave (Z = C of the shown octave; also - / = keys)
+  const NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+  const octShow = () => { const m = panel.keyboard && panel.keyboard.model; if (!m) return;
+    const n = m.baseNote + m.octave * 12; document.getElementById('octval').textContent = NAMES[n % 12] + (Math.floor(n / 12) - 1); };
+  const octStep = (d) => (ev) => { const kb = panel.keyboard; if (kb) kb.setOctave(kb.model.octave + d); octShow(); ev.currentTarget.blur(); };
+  document.getElementById('octdn').onclick = octStep(-1);
+  document.getElementById('octup').onclick = octStep(1);
+  window.addEventListener('keyup', octShow); octShow();
+  // audio: the WASM engine (tasks/m4-wasm-worklet, the C++ core) in an AudioWorklet; started by a click
+  document.getElementById('audio').onclick = async (ev) => {
+    ev.target.disabled = true; st.textContent = 'starting audio…';
+    try {
+      const ctx = new AudioContext({ latencyHint: 'interactive' });
+      await ctx.resume();
+      const eng = await Synth1Engine.create(ctx);
+      panel.setEngine(eng); window.audioCtx = ctx; window.synthEngine = eng;
+      const lat = Math.round(((ctx.baseLatency || 0) + (ctx.outputLatency || 0)) * 1000);
+      ev.target.textContent = 'audio on (' + ctx.sampleRate + ' Hz' + (eng.mainThread ? ', main thread: no https' : ', worklet') +
+        (lat ? ', ~' + lat + ' ms output' : '') + ')'; st.textContent = '';
+      // hardware MIDI keyboards (Web MIDI), all inputs, all channels
+      if (navigator.requestMIDIAccess) {
+        navigator.requestMIDIAccess().then((m) => {
+          let bankSel = null;
+          const hook = (inp) => { inp.onmidimessage = (e) => {
+            const [s, a, b] = e.data, t = s & 0xf0;
+            if (t === 0x90 && b > 0) panel.noteOn(a, b);
+            else if (t === 0x80 || (t === 0x90 && b === 0)) panel.noteOff(a);
+            else if (t === 0xb0 && a === 0) {   // bank select (Options > MIDI > Receive Bank Select)
+              if (panel.settings.receivebank !== 0 && panel.banks) { const i = panel.banks.findIndex((k) => k.slot === b); if (i >= 0) bankSel = i; }
+            }
+            else if (t === 0xb0) { panel.cc(a, b); if (a === 1) panel.setModWheel(b); }
+            else if (t === 0xc0) {             // program change (Receive Program Change)
+              if (panel.settings.receiveprog !== 0) panel.loadProgram(bankSel !== null ? bankSel : panel.current.bank, a);
+            }
+            else if (t === 0xe0) { const pb = (b << 7 | a) - 8192; panel.pitchBend(pb); panel.setPitchBend(pb); }
+            else if (t === 0xd0) panel.aftertouch(b);
+          }; };
+          m.inputs.forEach(hook); m.onstatechange = (e) => { if (e.port.type === 'input' && e.port.state === 'connected') hook(e.port); };
+        }).catch(() => {});
+      }
+    } catch (e) { st.textContent = 'audio failed: ' + e; ev.target.disabled = false; }
+  };
+  document.getElementById('sy1').onchange = async (e) => {
+    const f = e.target.files[0]; if (!f) return;
+    const s = panel.loadSy1(await f.text(), 0);
+    st.textContent = s.name;
+  };
+})();
+</script>
+</body>
+</html>

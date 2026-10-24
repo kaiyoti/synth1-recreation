@@ -1,0 +1,23 @@
+/* Synth1 on-screen keyboard (M4 B4, + m4-wheels) — component styles.
+ * The canvas draws the keys and the pitch/mod wheels itself (keyboard.js paint); CSS only owns
+ * sizing, touch behaviour and the focus ring. Width always follows the container (mount() sets
+ * canvas.style.width from it). The ns-resize cursor over the wheel columns is set inline by the
+ * pointer-move handler.
+ */
+.synth1-keyboard {
+  display: block;
+  width: 100%;
+  height: auto;
+  background: #101010;
+  touch-action: none;              /* no browser pan/zoom while glissandoing */
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  cursor: default;
+  outline: none;
+  border-radius: 0 0 3px 3px;
+}
+.synth1-keyboard:focus-visible {
+  outline: 1px solid #4d90d8;
+  outline-offset: -1px;
+}
