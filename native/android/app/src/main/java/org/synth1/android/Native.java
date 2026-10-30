@@ -6,7 +6,9 @@ final class Native {
     static native String nStartAudio();
     static native void nStopAudio();
     static native String nStatus();
-    static native void nSetSkin(String name);
+    static native void nSetDensity(float dpi);
+    static native void nSetKeyboardVisible(boolean on);
+    static native boolean nKeyboardVisible();
     static native void nSurface(android.view.Surface s, int w, int h);
     static native void nSurfaceDestroyed();
     /** action: 0 down, 1 move, 2 up, 3 cancel(all); id = MotionEvent pointer id; timeMs = event time. */

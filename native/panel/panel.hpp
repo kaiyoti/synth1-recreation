@@ -119,6 +119,8 @@ class Panel {
     slot = banks_[i].slot;
     return true;
   }
+  int currentBank() const { return curBank_; }
+  int currentProgram() const { return curProgram_; }
   int bankCount() const { return static_cast<int>(banks_.size()); }
 
   /* .sy1 text in/out (the web panel_app parseSy1 / sy1Text). */

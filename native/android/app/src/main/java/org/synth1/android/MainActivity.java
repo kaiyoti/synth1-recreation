@@ -16,9 +16,6 @@ import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
 import android.view.WindowManager;
-import android.widget.Button;
-import android.widget.LinearLayout;
-import android.widget.TextView;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -33,9 +30,7 @@ import java.util.List;
  *  (the MIDI bytes are read natively with AMidi on the audio thread). */
 public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final String TAG = "Synth1";
-    private static final String[] SKINS = {"classic", "s80"};
-    private TextView status;
-    private Button skinBtn;
+    private boolean kbShown = true;
     private SurfaceHolder holder;
     private int surfW, surfH;
     private SharedPreferences prefs;
@@ -51,27 +46,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         File files = getFilesDir();
         try { extractAssets(files); } catch (IOException e) { Log.e(TAG, "asset extract", e); }
         Native.nInit(files.getAbsolutePath());
-        Native.nSetSkin(skinName());
+        kbShown = prefs.getBoolean("kbd_visible", true);   // default: shown
+        Native.nSetKeyboardVisible(kbShown);
 
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
+        android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
+        Native.nSetDensity(dm.xdpi > 50f ? dm.xdpi : dm.densityDpi);   // white keys ~9 mm
         SurfaceView sv = new SurfaceView(this);
         sv.getHolder().addCallback(this);
         sv.setOnTouchListener((v, ev) -> { handleTouch(ev); return true; });
-        root.addView(sv, new LinearLayout.LayoutParams(-1, 0, 1f));
-
-        LinearLayout bar = new LinearLayout(this);
-        bar.setOrientation(LinearLayout.HORIZONTAL);
-        skinBtn = new Button(this);
-        skinBtn.setTextSize(11f);
-        skinBtn.setText("Skin: " + skinName());
-        skinBtn.setOnClickListener(v -> toggleSkin());
-        bar.addView(skinBtn, new LinearLayout.LayoutParams(-2, -2));
-        status = new TextView(this);
-        status.setTextSize(10f);
-        bar.addView(status, new LinearLayout.LayoutParams(-1, -2));
-        root.addView(bar, new LinearLayout.LayoutParams(-1, -2));
-        setContentView(root);
+        setContentView(sv);   // the whole screen is the synth: no Java bar (status = INFO in the VIEW column)
 
         // adb-driven on-device render gate: am start ... --es render_slots 001,002
         String slots = getIntent().getStringExtra("render_slots");
@@ -83,21 +66,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 Log.i(TAG, "render " + s + " -> " + r);
             }
         }
-    }
-
-    private String skinName() {
-        String s = prefs.getString("skin", SKINS[0]);
-        for (String k : SKINS) if (k.equals(s)) return s;
-        return SKINS[0];
-    }
-
-    private void toggleSkin() {
-        String cur = skinName();
-        String next = cur.equals(SKINS[0]) ? SKINS[1] : SKINS[0];
-        prefs.edit().putString("skin", next).apply();
-        Native.nSetSkin(next);
-        skinBtn.setText("Skin: " + next);
-        if (holder != null) Native.nSurface(holder.getSurface(), surfW, surfH);   // rebuild the panel
     }
 
     // all pointers: down / pointer-down / move / up / pointer-up / cancel -> native multi-pointer API
@@ -137,7 +105,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         startMidi();
         ui.post(new Runnable() { int n = 0; public void run() {
             Native.nPoll();
-            if (++n % 30 == 0) status.setText(Native.nStatus());
+            boolean kv = Native.nKeyboardVisible();   // KBD toggle in the side pane -> prefs
+            if (kv != kbShown) { kbShown = kv; prefs.edit().putBoolean("kbd_visible", kv).apply(); }
+            n++;
             ui.postDelayed(this, 33); } });
     }
 

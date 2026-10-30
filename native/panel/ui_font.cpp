@@ -1,10 +1,18 @@
 #include "ui_font.hpp"
 
+#include <cstdlib>
+
 namespace synth1 {
 namespace panel {
 namespace {
 #include "ui_font_data.inc"
+#include "ui_font_big.inc"
+const UiFont kBigFonts[5] = {{kP16Glyphs, kP16Data, kP16Ascent, kP16Descent}, {kP22Glyphs, kP22Data, kP22Ascent, kP22Descent},
+                             {kP30Glyphs, kP30Data, kP30Ascent, kP30Descent}, {kP42Glyphs, kP42Data, kP42Ascent, kP42Descent},
+                             {kP56Glyphs, kP56Data, kP56Ascent, kP56Descent}};
+const int kBigPx[5] = {16, 22, 30, 42, 56};
 const UiFont kRegFont = {kRegGlyphs, kRegData, kRegAscent, kRegDescent};
+const UiFont kMonoFont = {kMonoGlyphs, kMonoData, kMonoAscent, kMonoDescent};
 const UiFont kBoldFont = {kBoldGlyphs, kBoldData, kBoldAscent, kBoldDescent};
 const UiGlyph* glyphOf(const UiFont& f, unsigned char c) {
   return (c < 32 || c > 126) ? nullptr : &f.glyphs[c - 32];
@@ -12,7 +20,14 @@ const UiGlyph* glyphOf(const UiFont& f, unsigned char c) {
 }   // namespace
 
 const UiFont& uiFontRegular() { return kRegFont; }
+const UiFont& uiFontRegularPx(int px, int* actualPx) {
+  int best = 0;
+  for (int i = 1; i < 5; ++i) if (std::abs(kBigPx[i] - px) < std::abs(kBigPx[best] - px)) best = i;
+  if (actualPx) *actualPx = kBigPx[best];
+  return kBigFonts[best];
+}
 const UiFont& uiFontBold() { return kBoldFont; }
+const UiFont& uiFontMonoBold() { return kMonoFont; }
 
 int uiTextWidth(const UiFont& f, const std::string& s) {
   int w = 0;

@@ -9,6 +9,7 @@
 #include <oboe/Oboe.h>
 
 #include <atomic>
+#include <chrono>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -41,7 +42,13 @@ struct App {
   std::string audioInfo = "audio: not started";
   std::shared_ptr<oboe::AudioStream> stream;
   std::vector<float> L, R;
-  std::string skin = "classic";
+  std::string skin = "classic";   // the app is classic-only
+  std::atomic<bool> kbVisible{true};
+  float dpi = 420.f;
+  long lastMidiMsgs = 0;
+  std::chrono::steady_clock::time_point lastMidi{};
+  bool lamp = false;
+  int pollN = 0;
   int curBank = 0;
 };
 App g;
@@ -173,21 +180,28 @@ void drawLocked() {
   ANativeWindow_unlockAndPost(g.window);
 }
 
-void wirePanel() {
+void attachPanel() {
   auto& p = g.view.panel();
-  p.loadProgram(0, 0);
-  g.curBank = 0;
   p.onParam = [](int id, int v) { g.host.paramSet(id, v); };
   p.onProgram = [](int bank, int prog) {
     g.curBank = bank;
     g.host.load(g.view.panel().sy1Text(), prog, g.sampleRate, kEngineBlock);
   };
+}
+
+void wirePanel() {
+  auto& p = g.view.panel();
+  g.view.loadInitialProgram();
+  g.curBank = 0;
+  attachPanel();
+  g.view.onRebuilt = attachPanel;   // keyboard toggle / resize rebuild the panel: re-attach callbacks
   g.host.load(p.sy1Text(), 0, g.sampleRate, kEngineBlock);
   // on-screen keyboard -> engine (UI thread is the only ring producer)
   g.view.onNoteOn = [](int n, int v) { g.host.noteOn(n, v); };
   g.view.onNoteOff = [](int n) { g.host.noteOff(n); };
   g.view.onPitchBend = [](int s) { g.host.pitchBend(s); };
   g.view.onModWheel = [](int v) { g.host.cc(1, v); };
+  g.view.onAllNotesOff = []() { for (int n = 0; n < 128; ++n) g.host.noteOff(n); };   // PANIC
   // bank table for MIDI bank select (CC0 value = bank slot)
   std::vector<int> slots;
   for (int i = 0;; ++i) {
@@ -254,13 +268,16 @@ JNIEXPORT void JNICALL Java_org_synth1_android_Native_nStopAudio(JNIEnv*, jclass
   g.audioInfo = "audio: stopped";
 }
 
-JNIEXPORT jstring JNICALL Java_org_synth1_android_Native_nStatus(JNIEnv* e, jclass) {
+std::string statusText() {
   char buf[400];
   snprintf(buf, sizeof buf, "%s | callbacks=%ld | %s scale=%d (skin %d x%d) | midi in=%d msgs=%ld",
            g.audioInfo.c_str(), g.callbacks.load(), g.skin.c_str(), g.viewOk ? g.view.nativeScale() : 0,
-           g.viewOk ? g.view.skinScale() : 0, g.viewOk ? g.view.mult() : 0, midiCount.load(),
-           midiMsgs.load());
-  return e->NewStringUTF(buf);
+           g.viewOk ? g.view.skinScale() : 0, g.viewOk ? g.view.mult() : 0, midiCount.load(), midiMsgs.load());
+  return buf;
+}
+
+JNIEXPORT jstring JNICALL Java_org_synth1_android_Native_nStatus(JNIEnv* e, jclass) {
+  return e->NewStringUTF(statusText().c_str());
 }
 
 JNIEXPORT void JNICALL Java_org_synth1_android_Native_nSurface(JNIEnv* e, jclass, jobject surface,
@@ -270,9 +287,13 @@ JNIEXPORT void JNICALL Java_org_synth1_android_Native_nSurface(JNIEnv* e, jclass
   g.window = ANativeWindow_fromSurface(e, surface);
   ANativeWindow_setBuffersGeometry(g.window, w, h, WINDOW_FORMAT_RGBA_8888);
   std::string err;
-  g.viewOk = g.view.init(g.filesDir + "/skin/" + g.skin, w, h, err);
-  if (!g.viewOk) { LOGE("panel init failed: %s", err.c_str()); return; }
-  wirePanel();
+  if (g.viewOk) {                       // surface changed (rotation / resize): keep the panel state
+    if (!g.view.resize(w, h, err)) { g.viewOk = false; LOGE("panel resize failed: %s", err.c_str()); return; }
+  } else {
+    g.viewOk = g.view.init(g.filesDir + "/skin/" + g.skin, w, h, err, g.kbVisible, g.dpi);
+    if (!g.viewOk) { LOGE("panel init failed: %s", err.c_str()); return; }
+    wirePanel();
+  }
   LOGI("panel %dx%d native scale %d (skin %d x mult %d) on %dx%d surface", g.view.panelW(),
        g.view.panelH(), g.view.nativeScale(), g.view.skinScale(), g.view.mult(), w, h);
   drawLocked();
@@ -292,8 +313,13 @@ JNIEXPORT void JNICALL Java_org_synth1_android_Native_nTouch(JNIEnv*, jclass, ji
   drawLocked();
 }
 
-JNIEXPORT void JNICALL Java_org_synth1_android_Native_nSetSkin(JNIEnv* e, jclass, jstring name) {
-  g.skin = jstr(e, name);
+JNIEXPORT void JNICALL Java_org_synth1_android_Native_nSetKeyboardVisible(JNIEnv*, jclass, jboolean on) {
+  g.kbVisible = on;
+}
+
+JNIEXPORT jboolean JNICALL Java_org_synth1_android_Native_nKeyboardVisible(JNIEnv*, jclass) {
+  std::lock_guard<std::mutex> lk(g.uiMutex);
+  return g.viewOk ? g.view.keyboardVisible() : g.kbVisible.load();
 }
 
 // UI-thread tick (~30 Hz): drains audio-thread MIDI events into the panel/keyboard and redraws.
@@ -308,7 +334,18 @@ JNIEXPORT void JNICALL Java_org_synth1_android_Native_nPoll(JNIEnv*, jclass) {
     else if (ev.type == 1) g.view.setPitchBend(ev.a);
     else g.view.panel().loadProgram(ev.a >= 0 ? ev.a : g.curBank, ev.b);
   }
+  // MIDI-in lamp: lit for 150 ms after incoming data; INFO overlay text refreshed
+  const long m = midiMsgs.load();
+  const auto now = std::chrono::steady_clock::now();
+  if (m != g.lastMidiMsgs) { g.lastMidiMsgs = m; g.lastMidi = now; }
+  const bool lamp = now - g.lastMidi < std::chrono::milliseconds(150) && m > 0;
+  if (lamp != g.lamp) { g.lamp = lamp; g.view.setMidiLamp(lamp); any = true; }
+  if (g.view.infoVisible()) { g.view.setInfoText(statusText()); if (++g.pollN % 10 == 0) any = true; }
   if (any) drawLocked();
+}
+
+JNIEXPORT void JNICALL Java_org_synth1_android_Native_nSetDensity(JNIEnv*, jclass, jfloat dpi) {
+  if (dpi > 50.f) g.dpi = dpi;
 }
 
 // ---- hardware MIDI: Java opens the MidiDevice; the native side reads its output port(s) ----

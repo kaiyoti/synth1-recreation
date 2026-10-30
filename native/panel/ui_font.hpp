@@ -17,6 +17,9 @@ struct UiFont {
 
 const UiFont& uiFontRegular();
 const UiFont& uiFontBold();
+/* Anti-aliased DejaVu Sans at 16/22/30/42/56 px: the nearest to px (device-resolution text). */
+const UiFont& uiFontRegularPx(int px, int* actualPx = nullptr);
+const UiFont& uiFontMonoBold();   // DejaVu Sans Mono Bold 10 px: the classic skin's label font
 int uiTextWidth(const UiFont& f, const std::string& s);
 /* Alpha-blend text (fg rgb) onto an RGBA buffer (w*h*4); (x, baseline) = pen origin; scale >= 1
  * replicates pixels. */

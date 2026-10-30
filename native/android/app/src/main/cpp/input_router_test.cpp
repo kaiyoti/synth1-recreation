@@ -137,75 +137,158 @@ static void testEnginePath(const std::string& preset) {
   CHECK(std::memcmp(a.data(), c.data(), 10 * 512 * 4) == 0);
 }
 
+static void tapAt(PanelView& v, int id, float x, float y, long long t) { v.pointer(0, id, x, y, t); v.pointer(2, id, x, y, t + 40); }
+static void tapItem(PanelView& v, PanelView::Item it, int id, long long t) {
+  const auto r = v.itemRect(it);
+  tapAt(v, id, r.x + r.w / 2.f, r.y + r.h / 2.f, t);
+}
+static bool keyPos(PanelView& v, int note, float& sx, float& sy) {
+  const auto kr = v.keyboardRect();
+  auto& kb = v.keyboard();
+  const int k = v.nativeScale();
+  for (double x = 0; x < kb.width; x += 0.5) {
+    const double y = kb.height * 0.85;
+    if (kb.noteAt(x, y) == note) { sx = kr.x + (float)(x * k); sy = kr.y + (float)(y * k); return true; }
+  }
+  return false;
+}
+
 static void testWiring(const std::string& root) {
-  printf("Shell wiring (PanelView keyboard + octave bar)\n");
+  printf("Shell wiring (keyboard, OCT+/-, PANIC, INFO, wheels in the WHEEL column)\n");
   PanelView v; std::string err;
-  CHECK(v.init(root + "/classic", 2400, 1080, err));
+  CHECK(v.init(root + "/classic", 2400, 1080, err, true, 420.f));
+  CHECK(v.landscape() && v.octaves() == 3 && v.whiteKeys() == 22);
   std::vector<std::string> ev;
+  int panics = 0;
   v.onNoteOn = [&](int n, int vel) { ev.push_back("on " + std::to_string(n) + " " + std::to_string(vel > 0)); };
   v.onNoteOff = [&](int n) { ev.push_back("off " + std::to_string(n)); };
   v.onPitchBend = [&](int s) { ev.push_back("bend " + std::to_string(s)); };
   v.onModWheel = [&](int m) { ev.push_back("mod " + std::to_string(m)); };
-  const auto kr = v.keyboardRect(), br = v.barRect();
+  v.onAllNotesOff = [&]() { ++panics; };
   const int k = v.nativeScale();
-  auto& kb = v.keyboard();
-  auto keyPos = [&](int note, float& sx, float& sy) {
-    for (double x = 0; x < kb.width; x += 0.5) {
-      const double y = kb.height * 0.85;
-      if (kb.noteAt(x, y) == note) { sx = kr.x + (float)(x * k); sy = kr.y + (float)(y * k); return true; }
-    }
-    return false;
-  };
   float x60, y60, x64, y64;
-  CHECK(keyPos(60, x60, y60) && keyPos(64, x64, y64));
+  CHECK(keyPos(v, 60, x60, y60) && keyPos(v, 64, x64, y64));
   v.pointer(0, 0, x60, y60, 1);
   CHECK(ev.size() == 1 && ev[0].rfind("on 60", 0) == 0);
-  v.pointer(0, 1, x64, y64, 2);                                     // second finger: second note
+  v.pointer(0, 1, x64, y64, 2);
   CHECK(ev.size() == 2 && ev[1].rfind("on 64", 0) == 0);
-  // Oct+ button on the bar (logical x 48..88, y 2..14)
-  const float bx = br.x + 60.f * k, by = br.y + 8.f * k;
-  v.pointer(0, 2, bx, by, 3); v.pointer(2, 2, bx, by, 4);
+  tapItem(v, PanelView::kOctUp, 2, 3);                       // OCT +
   CHECK(v.octave().octave() == 1);
-  v.pointer(2, 0, x60, y60, 5);                                     // lift the note started before the shift
+  v.pointer(2, 0, x60, y60, 5);                              // note started before the shift releases as 60
   CHECK(ev.size() == 3 && ev[2] == "off 60");
-  v.pointer(0, 3, x60, y60, 6);                                     // new press is shifted +12
+  v.pointer(0, 3, x60, y60, 6);                              // new press is shifted +12
   CHECK(ev.size() == 4 && ev[3].rfind("on 72", 0) == 0);
   v.pointer(2, 3, x60, y60, 7);
   CHECK(ev.back() == "off 72");
   v.pointer(2, 1, x64, y64, 8);
   CHECK(ev.back() == "off 64");
-  // Oct- twice -> -1
-  const float mx = br.x + 20.f * k;
-  for (int i = 0; i < 2; ++i) { v.pointer(0, 5, mx, by, 10); v.pointer(2, 5, mx, by, 11); }
+  tapItem(v, PanelView::kOctDown, 5, 10); tapItem(v, PanelView::kOctDown, 5, 20);   // OCT - twice
   CHECK(v.octave().octave() == -1);
-  // wheels: pitch (left half of the wheel block) and mod (right half)
+  for (int i = 0; i < 6; ++i) tapItem(v, PanelView::kOctDown, 5, 100 + i * 100);
+  CHECK(v.octave().octave() == -3);                          // clamps
+  for (int i = 0; i < 6; ++i) tapItem(v, PanelView::kOctUp, 5, 1000 + i * 100);
+  CHECK(v.octave().octave() == 3);
+  for (int i = 0; i < 3; ++i) tapItem(v, PanelView::kOctDown, 5, 2000 + i * 100);
+  CHECK(v.octave().octave() == 0);
+  // wheels in the WHEEL column: pitch = left wheel, mod = right wheel
+  const auto wp = v.wheelRect(0), wm = v.wheelRect(1);
+  CHECK(wp.w > 0 && wp.h >= 200 && wm.x > wp.x && wp.w <= 12 * 420 / 25.4 + 1);
   ev.clear();
-  v.pointer(0, 7, kr.x + 10.f * k, kr.y + 20.f * k, 20);
-  CHECK(!ev.empty() && ev[0].rfind("bend", 0) == 0);
-  v.pointer(2, 7, kr.x + 10.f * k, kr.y + 20.f * k, 21);
-  CHECK(ev.back() == "bend 0");                                     // pitch springs back
+  const float py = wp.y + wp.h * 0.25f;
+  v.pointer(0, 7, wp.x + wp.w / 2.f, py, 3000);
+  CHECK(!ev.empty() && ev[0].rfind("bend", 0) == 0 && ev[0] != "bend 0");
+  v.pointer(2, 7, wp.x + wp.w / 2.f, py, 3010);
+  CHECK(ev.back() == "bend 0");                              // pitch springs back
   ev.clear();
-  v.pointer(0, 8, kr.x + 42.f * k, kr.y + 20.f * k, 22);
-  CHECK(!ev.empty() && ev[0].rfind("mod", 0) == 0);
-  v.pointer(2, 8, kr.x + 42.f * k, kr.y + 20.f * k, 23);
+  v.pointer(0, 8, wm.x + wm.w / 2.f, py, 3020);
+  CHECK(!ev.empty() && ev[0].rfind("mod", 0) == 0 && ev[0] != "mod 0");
+  v.pointer(2, 8, wm.x + wm.w / 2.f, py, 3030);
+  CHECK(ev.back().rfind("mod", 0) == 0);                     // mod wheel persists
+  // wheels + keys at the same time (multitouch)
+  ev.clear();
+  v.pointer(0, 9, wp.x + wp.w / 2.f, py, 3100); v.pointer(0, 10, x60, y60, 3101); v.pointer(0, 11, x64, y64, 3102);
+  int ons = 0, bends = 0;
+  for (auto& e : ev) { if (e.rfind("on", 0) == 0) ++ons; if (e.rfind("bend", 0) == 0) ++bends; }
+  CHECK(ons == 2 && bends >= 1);
+  v.pointer(2, 9, wp.x + wp.w / 2.f, py, 3110); v.pointer(2, 10, x60, y60, 3111); v.pointer(2, 11, x64, y64, 3112);
+  // PANIC: hold two keys, tap PANIC -> both released + all-notes-off hook
+  ev.clear(); panics = 0;
+  v.pointer(0, 12, x60, y60, 4000); v.pointer(0, 13, x64, y64, 4001);
+  tapItem(v, PanelView::kPanic, 14, 4100);
+  int offs = 0; for (auto& e : ev) if (e.rfind("off", 0) == 0) ++offs;
+  CHECK(offs == 2 && panics == 1);
+  v.pointer(3, 0, 0, 0, 4200);
+  // INFO toggles the overlay flag, nothing else changes
+  const auto kr0 = v.keyboardRect();
+  CHECK(!v.infoVisible());
+  tapItem(v, PanelView::kInfo, 15, 5000);
+  CHECK(v.infoVisible() && v.keyboardVisible() && v.keyboardRect().h == kr0.h && v.nativeScale() == k);
+  tapItem(v, PanelView::kInfo, 15, 5100);
+  CHECK(!v.infoVisible());
   // cancel releases everything
   ev.clear();
-  v.pointer(0, 9, x60, y60, 30); v.pointer(0, 10, x64, y64, 31);
-  v.pointer(3, 0, 0, 0, 32);
-  int offs = 0; for (auto& e : ev) if (e.rfind("off", 0) == 0) ++offs;
+  v.pointer(0, 16, x60, y60, 6000); v.pointer(0, 17, x64, y64, 6001);
+  v.pointer(3, 0, 0, 0, 6002);
+  offs = 0; for (auto& e : ev) if (e.rfind("off", 0) == 0) ++offs;
   CHECK(offs == 2);
-  // panel pointer API: two fingers, knob drag + tap elsewhere do not crash and the panel stays consistent
+  // panel pointer API: two fingers (knob drag + tap elsewhere)
   const auto pr = v.panelRect();
-  v.pointer(0, 11, pr.x + 91.f * k, pr.y + 50.f * k, 40);
-  v.pointer(0, 12, pr.x + 21.f * k, pr.y + 107.f * k, 41);
-  v.pointer(2, 12, pr.x + 21.f * k, pr.y + 107.f * k, 60);
-  v.pointer(2, 11, pr.x + 91.f * k, pr.y + 50.f * k, 70);
+  v.pointer(0, 18, pr.x + 91.f * k, pr.y + 50.f * k, 7000);
+  v.pointer(0, 19, pr.x + 21.f * k, pr.y + 107.f * k, 7001);
+  v.pointer(2, 19, pr.x + 21.f * k, pr.y + 107.f * k, 7060);
+  v.pointer(2, 18, pr.x + 91.f * k, pr.y + 50.f * k, 7070);
   CHECK(v.panel().activePointerCount() == 0);
-  // program change from the select window (bank 5 program 3) reaches the panel's onProgram
   int gotBank = -1, gotProg = -1;
   v.panel().onProgram = [&](int b, int p) { gotBank = b; gotProg = p; };
   v.panel().loadProgram(5, 3);
   CHECK(gotBank == 5 && gotProg == 3);
+}
+
+static void testPane(const std::string& root, bool portrait) {
+  printf("KBD toggle / relayout (%s)\n", portrait ? "portrait 1080x2400" : "landscape 2400x1080");
+  PanelView v; std::string err;
+  const int W = portrait ? 1080 : 2400, H = portrait ? 2400 : 1080;
+  CHECK(v.init(root + "/classic", W, H, err, true, 420.f));
+  CHECK(v.landscape() == !portrait);
+  int rebuilt = 0;
+  v.onRebuilt = [&]() { ++rebuilt; };
+  std::vector<std::string> ev;
+  v.onNoteOn = [&](int n, int) { ev.push_back("on " + std::to_string(n)); };
+  v.onNoteOff = [&](int n) { ev.push_back("off " + std::to_string(n)); };
+  const int k0 = v.nativeScale();
+  v.panel().loadProgram(5, 3);
+  v.panel().setParam(10, 33);
+  const int p10 = v.panel().getParam(10);
+  auto pr = v.panelRect();
+  const auto vb = v.viewBoxRect();
+  tapAt(v, 1, pr.x + 21.f * k0, pr.y + 107.f * k0, 10);                   // panel tap
+  tapAt(v, 2, vb.x + 8.f * k0, vb.y + 4.f * k0, 20);                      // VIEW header bar
+  tapAt(v, 3, vb.x + vb.w - 2.f * k0, vb.y + vb.h - 2.f * k0, 30);        // empty corner
+  tapAt(v, 4, v.itemRect(PanelView::kMidi).x + 3.f, v.itemRect(PanelView::kMidi).y + 3.f, 35);   // MIDI lamp (not a button)
+  CHECK(v.keyboardVisible() && rebuilt == 0 && v.nativeScale() == k0);
+  const auto b1 = v.itemRect(PanelView::kKbd);
+  CHECK(b1.w > 0 && b1.x >= vb.x && b1.x + b1.w <= vb.x + vb.w && b1.y + b1.h <= vb.y + vb.h);
+  v.pointer(0, 5, b1.x + 5.f, b1.y + 5.f, 40); v.pointer(2, 5, pr.x + 10.f, pr.y + 10.f, 80);   // lift outside: no toggle
+  CHECK(v.keyboardVisible() && rebuilt == 0);
+  tapItem(v, PanelView::kKbd, 6, 100);                                    // KBD: off
+  CHECK(!v.keyboardVisible() && rebuilt == 1);
+  CHECK(portrait ? v.nativeScale() >= k0 : v.nativeScale() > k0);
+  CHECK(v.keyboardRect().w == 0);
+  CHECK(v.panel().currentBank() == 5 && v.panel().currentProgram() == 3 && v.panel().getParam(10) == p10);
+  printf("  k %d -> %d with the keyboard hidden\n", k0, v.nativeScale());
+  const int k1 = v.nativeScale();
+  tapAt(v, 7, v.panelRect().x + 21.f * k1, v.panelRect().y + 107.f * k1, 200);
+  tapAt(v, 8, W / 2.f, H - 5.f, 210);                                     // where the keyboard was: nothing
+  CHECK(!v.keyboardVisible() && ev.empty() && rebuilt == 1);
+  tapItem(v, PanelView::kKbd, 9, 300);                                    // KBD: on again
+  CHECK(v.keyboardVisible() && rebuilt == 2 && v.nativeScale() == k0);
+  CHECK(v.panel().currentBank() == 5 && v.panel().getParam(10) == p10);
+  float xa, ya, xb, yb;
+  CHECK(keyPos(v, 60, xa, ya) && keyPos(v, 64, xb, yb));
+  v.pointer(0, 11, xa, ya, 400); v.pointer(0, 12, xb, yb, 401);
+  CHECK(ev.size() == 2 && ev[0] == "on 60" && ev[1] == "on 64");
+  v.pointer(2, 11, xa, ya, 402); v.pointer(2, 12, xb, yb, 403);
+  CHECK(ev.size() == 4 && ev[2] == "off 60" && ev[3] == "off 64");
 }
 
 int main(int argc, char** argv) {
@@ -214,6 +297,8 @@ int main(int argc, char** argv) {
   testOctave();
   testEnginePath(argv[2]);
   testWiring(argv[1]);
+  testPane(argv[1], false);
+  testPane(argv[1], true);
   printf("input_router_test: %d checks, %d failed -> %s\n", g_n, g_fail, g_fail ? "FAIL" : "PASS");
   return g_fail != 0;
 }

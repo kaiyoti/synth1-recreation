@@ -5,14 +5,18 @@
 #include <cstdio>
 #include <cstring>
 #include <set>
+#include <initializer_list>
 
 #include "ui_font.hpp"
 
 namespace synth1_android {
 
 using synth1::panel::Panel;
+namespace ui = synth1::panel;
 
 namespace {
+constexpr uint32_t kClear = 0xFF87C8C8u;   // RGBA bytes (200,200,135,255): the classic frame colour
+
 void replicate(uint8_t* dst, int dw, int dh, int rowBytes, const uint8_t* src, int sw, int sh, int ox,
                int oy, int m) {
   const uint32_t* s32 = reinterpret_cast<const uint32_t*>(src);
@@ -28,90 +32,260 @@ void replicate(uint8_t* dst, int dw, int dh, int rowBytes, const uint8_t* src, i
     }
   }
 }
+
+void fillRect(std::vector<uint8_t>& b, int W, int H, int x0, int y0, int x1, int y1, int r, int g, int bl) {
+  for (int y = std::max(0, y0); y < std::min(H, y1); ++y)
+    for (int x = std::max(0, x0); x < std::min(W, x1); ++x) {
+      uint8_t* p = &b[((size_t)y * W + x) * 4];
+      p[0] = (uint8_t)r; p[1] = (uint8_t)g; p[2] = (uint8_t)bl; p[3] = 255;
+    }
+}
+
+// ---- anti-aliased primitives at device resolution (wheels) ----
+inline void blendPx(uint8_t* dst, int dw, int dh, int rowBytes, int x, int y, const uint8_t rgb[3], float a) {
+  if (x < 0 || y < 0 || x >= dw || y >= dh || a <= 0.f) return;
+  uint8_t* p = dst + (size_t)y * rowBytes + (size_t)x * 4;
+  if (a > 1.f) a = 1.f;
+  for (int i = 0; i < 3; ++i) p[i] = (uint8_t)(p[i] + (rgb[i] - p[i]) * a + 0.5f);
+  p[3] = 255;
+}
+float sdRoundBox(float px, float py, float cx, float cy, float hw, float hh, float r) {
+  const float qx = std::fabs(px - cx) - hw + r, qy = std::fabs(py - cy) - hh + r;
+  const float ox = std::max(qx, 0.f), oy = std::max(qy, 0.f);
+  return std::sqrt(ox * ox + oy * oy) + std::min(std::max(qx, qy), 0.f) - r;
+}
+// fill (stroke <= 0) or outline (stroke width) of a rounded box [x,x+w) x [y,y+h)
+void roundBox(uint8_t* dst, int dw, int dh, int rowBytes, float x, float y, float w, float h, float r, const uint8_t rgb[3],
+              float stroke) {
+  const float cx = x + w / 2, cy = y + h / 2, hw = w / 2, hh = h / 2;
+  for (int py = (int)std::floor(y) - 1; py <= (int)std::ceil(y + h) + 1; ++py)
+    for (int px = (int)std::floor(x) - 1; px <= (int)std::ceil(x + w) + 1; ++px) {
+      const float d = sdRoundBox(px + 0.5f, py + 0.5f, cx, cy, hw, hh, r);
+      const float a = stroke > 0 ? 0.5f - (std::fabs(d + stroke / 2) - stroke / 2) : 0.5f - d;
+      blendPx(dst, dw, dh, rowBytes, px, py, rgb, std::min(1.f, a));
+    }
+}
+// axis-aligned box with fractional edges (area coverage)
+void boxAA(uint8_t* dst, int dw, int dh, int rowBytes, float x0, float y0, float x1, float y1, const uint8_t rgb[3]) {
+  for (int py = (int)std::floor(y0); py < (int)std::ceil(y1); ++py)
+    for (int px = (int)std::floor(x0); px < (int)std::ceil(x1); ++px) {
+      const float cx = std::min<float>(px + 1, x1) - std::max<float>(px, x0), cy = std::min<float>(py + 1, y1) - std::max<float>(py, y0);
+      blendPx(dst, dw, dh, rowBytes, px, py, rgb, cx * cy);
+    }
+}
 }  // namespace
 
-bool PanelView::init(const std::string& root, int w, int h, std::string& err) {
-  surfW_ = w; surfH_ = h;
-  // 1x panel size from the 200 % skin (exactly 2x); fall back to the known 466x340.
-  int w1 = 466, h1 = 340;
+PanelView::Rect PanelView::Box::rect() const { return {px, py, lw * scale, lh * scale}; }
+
+bool PanelView::init(const std::string& root, int w, int h, std::string& err, bool kbVisible, float dpi) {
+  root_ = root; surfW_ = w; surfH_ = h; kbVisible_ = kbVisible; dpi_ = dpi;
+  int w1 = kPanelW, h1 = kPanelH;
   {
     Panel probe;
     std::string e;
     if (probe.load(root + "/200", 2, e)) { w1 = probe.width() / 2; h1 = probe.height() / 2; }
   }
-  int k = std::min(w / w1, h / (h1 + kBarH + kKbMin));
-  if (k < 1) k = 1;                      // smaller than 1x: clipped (documented limitation)
+  // ---- orientation + integer scale k ----
+  landscape_ = w >= h && w >= w1 + kMinWheelCol + kMinViewCol;
+  int k = 1;
+  if (landscape_) {
+    const int minKb = std::max((int)std::ceil(0.30 * h), 250);
+    for (int c = std::min(w / w1, h / h1); c >= 1; --c) {
+      const bool widthOk = w - w1 * c >= (kMinWheelCol + kMinViewCol) * c;
+      const bool kbOk = !kbVisible || h - h1 * c >= minKb;
+      if (widthOk && kbOk) { k = c; break; }
+    }
+  } else {
+    k = std::max(1, w / w1);
+    while (k > 1 && (h1 + kStripH) * k + (kbVisible ? 56 * k : 0) > h) --k;
+  }
   skin_ = (k % 2 == 0) ? 2 : 1;
   mult_ = k / skin_;
   panel_.reset(new Panel());
   if (!panel_->load(root + (skin_ == 2 ? "/200" : "/100"), skin_, err)) return false;
-  panel_->setTouchMode(true);            // P1 touch semantics: preview on down / select on lift
-  panel_->setSelectLabels(true);         // bank tree / heading text from banks.json (web paintSel)
-
+  panel_->setTouchMode(true);
+  panel_->setSelectLabels(true);
   selScale_ = std::max(1, std::min(w / (panel_->selectClientWidth() + 2), h / (panel_->selectClientHeight() + 2)));
-  const int lw = std::max(1, w / k), lh = std::max(1, h / k);
-  const int kbH = std::max(kKbMin, std::min(kKbMax, lh - h1 - kBarH));
-  const int total = h1 + kBarH + kbH;
-  const int oy = std::max(0, (lh - total) / 2);
-  panelR_ = {(w - w1 * k) / 2, oy * k, w1 * k, h1 * k};
-  barR_ = {(w - lw * k) / 2, (oy + h1) * k, lw * k, kBarH * k};
-  kbR_ = {(w - lw * k) / 2, (oy + h1 + kBarH) * k, lw * k, kbH * k};
-  kbLogicalW_ = lw; kbLogicalH_ = kbH;
 
-  synth1::keyboard::Keyboard::Options o;
-  o.low = 36; o.high = 96; o.height = kbH;
-  kb_.reset(new synth1::keyboard::Keyboard(o));
-  kb_->layout(lw, kbH);
-  wireKeyboard();
-  region_.clear(); barBtn_.clear(); activeWheel_ = -1;
-  paintBar();
+  // ---- geometry (surface px) ----
+  const double mmpx = dpi / 25.4;
+  const int pwk = w1 * k, phk = h1 * k;
+  wheelBox_.scale = viewBox_.scale = k;
+  int belowY, belowH;
+  double ww;                                  // wheel width (px): <= 12 mm, centred in the WHEEL box
+  if (landscape_) {
+    const int leftover = w - pwk, lpx = leftover / 2, rpx = leftover - lpx;
+    panelR_ = {lpx, 0, pwk, phk};
+    wheelBox_.lw = (lpx + k - 1) / k; wheelBox_.lh = h1; wheelBox_.px = lpx - wheelBox_.lw * k; wheelBox_.py = 0;
+    viewBox_.lw = (rpx + k - 1) / k; viewBox_.lh = h1; viewBox_.px = lpx + pwk; viewBox_.py = 0;
+    belowY = phk; belowH = h - phk;
+    ww = std::min({12.0 * mmpx, lpx / 3.2, (h1 - kHeaderH - 8) * (double)k * 0.22});
+  } else {
+    panelR_ = {(w - pwk) / 2, 0, pwk, phk};
+    ww = std::min(12.0 * mmpx, (kStripH - kHeaderH - 8) * (double)k * 0.42);
+    wheelBox_.lw = (int)std::ceil(2.6 * ww / k) + 6; wheelBox_.lh = kStripH; wheelBox_.px = 0; wheelBox_.py = phk;
+    viewBox_.px = (wheelBox_.lw + 3) * k; viewBox_.lw = (w - viewBox_.px + k - 1) / k; viewBox_.lh = kStripH; viewBox_.py = phk;
+    belowY = phk + kStripH * k;
+    const int kbPx = (int)std::max(250.0, 32.0 * mmpx);       // a normal keyboard height (~32 mm)
+    belowH = std::max(0, std::min(h - belowY, kbPx));
+  }
+  belowR_ = {0, belowY, w, belowH};
+  wheelBox_.buf.assign((size_t)wheelBox_.lw * wheelBox_.lh * 4, 0);
+  viewBox_.buf.assign((size_t)viewBox_.lw * viewBox_.lh * 4, 0);
+  {
+    const int iww = std::max(8, (int)ww), gap = iww / 2, pair = 2 * iww + gap;
+    const int bx = wheelBox_.px, bw = wheelBox_.lw * k;
+    const int y0 = wheelBox_.py + (kHeaderH + 4) * k, hh = (wheelBox_.lh - kHeaderH - 8) * k;
+    const int x0 = bx + (bw - pair) / 2;
+    wheelRc_[0] = {x0, y0, iww, hh};
+    wheelRc_[1] = {x0 + iww + gap, y0, iww, hh};
+    wheelR_ = {x0, y0, pair, hh};
+  }
+  // ---- keyboard: whole octaves, white keys ~9 mm ----
+  kbLogicalW_ = (w + k - 1) / k;
+  kbLogicalH_ = std::max(8, (belowH + k - 1) / k);
+  {
+    const double keyPx = 6.5 * dpi / 25.4;   // white key target 6.5 mm
+    octaves_ = std::max(1, std::min(8, (int)std::lround((w / keyPx) / 7.0)));
+    kbLow_ = 60 - 12 * (octaves_ / 2);
+    synth1::keyboard::Keyboard::Options o;
+    o.low = kbLow_; o.high = kbLow_ + 12 * octaves_; o.height = kbLogicalH_; o.wheels = false;
+    kb_.reset(new synth1::keyboard::Keyboard(o));
+    kb_->layout(kbLogicalW_, kbLogicalH_);
+  }
+  wireKeyboards();
+  layoutCells();
+  region_.clear(); btn_.clear(); activeWheel_ = -1; needRebuild_ = false;
   return true;
 }
 
-void PanelView::wireKeyboard() {
-  kb_->onNoteOn = [this](int n, int v) { const int e = oct_.noteOn(n); if (onNoteOn) onNoteOn(e, v); };
-  kb_->onNoteOff = [this](int n) { const int e = oct_.noteOff(n); if (onNoteOff) onNoteOff(e); };
-  kb_->onPitchBend = [this](int v) { if (onPitchBend) onPitchBend(v); };
-  kb_->onModWheel = [this](int v) { if (onModWheel) onModWheel(v); };
+bool PanelView::rebuild(std::string& err) {
+  std::map<int, int> vals;
+  for (int id = 0; id <= 98; ++id) if (panel_->hasParam(id)) vals[id] = panel_->getParam(id);
+  if (panel_->hasParam(254)) vals[254] = panel_->getParam(254);
+  const int bank = panel_->currentBank(), prog = panel_->currentProgram();
+  if (!init(root_, surfW_, surfH_, err, kbVisible_, dpi_)) return false;
+  panel_->loadProgram(bank, prog);
+  panel_->setValues(vals);
+  if (onRebuilt) onRebuilt();
+  return true;
 }
 
-void PanelView::barRects(int& minusX, int& plusX, int& btnW) const { minusX = 4; plusX = 48; btnW = 40; }
+void PanelView::wireKeyboards() {
+  kb_->onNoteOn = [this](int n, int v) { const int e = oct_.noteOn(n); if (onNoteOn) onNoteOn(e, v); };
+  kb_->onNoteOff = [this](int n) { const int e = oct_.noteOff(n); if (onNoteOff) onNoteOff(e); };
+}
 
-void PanelView::paintBar() {
-  const int lw = kbLogicalW_;
-  barFrame_.assign((size_t)lw * kBarH * 4, 0);
-  for (size_t i = 0; i < barFrame_.size(); i += 4) {
-    barFrame_[i] = 0x22; barFrame_[i + 1] = 0x22; barFrame_[i + 2] = 0x28; barFrame_[i + 3] = 255;
-  }
-  int mx, px, bw;
-  barRects(mx, px, bw);
-  auto button = [&](int x, const char* label, bool pressed) {
-    for (int y = 2; y < kBarH - 2; ++y)
-      for (int xx = x; xx < x + bw; ++xx) {
-        uint8_t* p = &barFrame_[((size_t)y * lw + xx) * 4];
-        const bool edge = y == 2 || y == kBarH - 3 || xx == x || xx == x + bw - 1;
-        const uint8_t v = edge ? 0x90 : (pressed ? 0x78 : 0x44);
-        p[0] = p[1] = p[2] = v;
-      }
-    const uint8_t white[3] = {255, 255, 255};
-    const auto& f = synth1::panel::uiFontBold();
-    const int tw = synth1::panel::uiTextWidth(f, label);
-    synth1::panel::uiDrawText(barFrame_.data(), lw, kBarH, x + (bw - tw) / 2, 12, label, white, f);
+// VIEW column grid. Landscape: 1..3 columns by width; portrait strip: 4 columns x 2 rows.
+void PanelView::layoutCells() {
+  cells_.clear();
+  const int lw = viewBox_.lw, gap = 4, m = 6, pitch = 24;
+  const int top = landscape_ ? kHeaderH + 6 : kHeaderH + std::max(4, (viewBox_.lh - kHeaderH - 44) / 2);
+  int cols = landscape_ ? std::max(1, std::min(3, (lw - 2 * m + gap) / (48 + gap))) : 4;
+  if (!landscape_ && lw < 4 * 48 + 2 * m + 3 * gap) cols = 3;
+  const int cw = (lw - 2 * m - (cols - 1) * gap) / cols;
+  auto put = [&](Item it, int row, int col, int span) {
+    cells_.push_back({it, m + col * (cw + gap), top + row * pitch, cw * span + (span - 1) * gap, kBtnH});
   };
-  bool pm = false, pp = false;
-  for (auto& kv : barBtn_) { if (kv.second == 0) pm = true; else pp = true; }
-  button(mx, "Oct -", pm);
-  button(px, "Oct +", pp);
-  char buf[64];
-  const int o = oct_.octave();
-  std::snprintf(buf, sizeof buf, "Octave %s%d  (keys C%d-C%d)", o > 0 ? "+" : "", o, 2 + o, 7 + o);
-  const uint8_t grey[3] = {0xd0, 0xd0, 0xd8};
-  synth1::panel::uiDrawText(barFrame_.data(), lw, kBarH, 96, 12, buf, grey, synth1::panel::uiFontRegular());
+  if (!landscape_ && cols == 4) {
+    put(kKbd, 0, 0, 1); put(kInfo, 0, 1, 1); put(kPanic, 0, 2, 1); put(kMidi, 0, 3, 1);
+    put(kOctDown, 1, 0, 1); put(kOctLcd, 1, 1, 1); put(kOctUp, 1, 2, 1);
+  } else if (cols >= 3) {
+    put(kKbd, 0, 0, 1); put(kInfo, 0, 1, 1); put(kPanic, 0, 2, 1);
+    put(kOctDown, 1, 0, 1); put(kOctLcd, 1, 1, 1); put(kOctUp, 1, 2, 1);
+    put(kMidi, 2, 0, cols >= 3 ? 3 : 1);
+  } else if (cols == 2) {
+    put(kKbd, 0, 0, 1); put(kInfo, 0, 1, 1); put(kPanic, 1, 0, 1); put(kMidi, 1, 1, 1);
+    put(kOctDown, 2, 0, 1); put(kOctUp, 2, 1, 1); put(kOctLcd, 3, 0, 2);
+  } else {
+    int r = 0;
+    for (Item it : {kKbd, kInfo, kPanic, kOctDown, kOctLcd, kOctUp, kMidi}) put(it, r++, 0, 1);
+  }
+}
+
+PanelView::Rect PanelView::itemRect(Item i) const {
+  for (const Cell& c : cells_)
+    if (c.item == i) {
+      const int k = nativeScale();
+      return {viewBox_.px + c.x * k, viewBox_.py + c.y * k, c.w * k, c.h * k};
+    }
+  return {0, 0, 0, 0};
+}
+
+// classic keycap (tools/classic.py): outline, face+70 bevel, grey (200) unlit / (255,255,140) lit
+void PanelView::drawKeycap(Box& b, const Cell& c, const char* label, bool lit, bool pressed) {
+  const int W = b.lw, H = b.lh, x = c.x, y = c.y, w = c.w, h = c.h;
+  const int fr = lit ? 255 : 200, fg = lit ? 255 : 200, fb = lit ? 140 : 200;
+  auto lighter = [](int v) { return std::min(255, v + 70); };
+  fillRect(b.buf, W, H, x, y, x + w, y + h, pressed ? 96 : 0, pressed ? 96 : 0, pressed ? 96 : 0);
+  fillRect(b.buf, W, H, x, y, x + w - 1, y + h - 1, pressed ? 0 : lighter(fr), pressed ? 0 : lighter(fg),
+           pressed ? 0 : lighter(fb));
+  fillRect(b.buf, W, H, x + 1, y + 1, x + w - 1, y + h - 1, fr, fg, fb);
+  const int cx[4] = {x, x + w - 1, x, x + w - 1}, cy[4] = {y, y, y + h - 1, y + h - 1};
+  for (int i = 0; i < 4; ++i) fillRect(b.buf, W, H, cx[i], cy[i], cx[i] + 1, cy[i] + 1, 200, 200, 135);
+  const uint8_t black[3] = {0, 0, 0};
+  const auto& mono = ui::uiFontMonoBold();
+  const int tw = ui::uiTextWidth(mono, label), o = pressed ? 1 : 0;
+  ui::uiDrawText(b.buf.data(), W, H, x + (w - tw) / 2 + o, y + h / 2 + 4 + o, label, black, mono);
+}
+
+void PanelView::paintBoxes() {
+  const uint8_t title[3] = {200, 200, 200};
+  const auto& mono = ui::uiFontMonoBold();
+  for (Box* b : {&wheelBox_, &viewBox_}) {
+    fillRect(b->buf, b->lw, b->lh, 0, 0, b->lw, b->lh, 60, 60, 60);                 // 1 px line
+    fillRect(b->buf, b->lw, b->lh, 1, 1, b->lw - 1, b->lh - 1, 200, 200, 135);      // box fill
+    fillRect(b->buf, b->lw, b->lh, 1, 1, b->lw - 1, kHeaderH, 60, 60, 60);          // header bar
+  }
+  ui::uiDrawText(wheelBox_.buf.data(), wheelBox_.lw, wheelBox_.lh, 4, 10, "WHEEL", title, mono);
+  ui::uiDrawText(viewBox_.buf.data(), viewBox_.lw, viewBox_.lh, 4, 10, "VIEW", title, mono);
+  // VIEW items
+  for (const Cell& c : cells_) {
+    bool pressed = false;
+    for (auto& kv : btn_) if (kv.second == c.item) pressed = true;
+    if (c.item == kKbd) drawKeycap(viewBox_, c, "KBD", kbVisible_, pressed);
+    else if (c.item == kInfo) drawKeycap(viewBox_, c, "INFO", info_, pressed);
+    else if (c.item == kPanic) drawKeycap(viewBox_, c, "PANIC", false, pressed);
+    else if (c.item == kOctDown) drawKeycap(viewBox_, c, "OCT -", false, pressed);
+    else if (c.item == kOctUp) drawKeycap(viewBox_, c, "OCT +", false, pressed);
+    else if (c.item == kOctLcd) {   // classic teal LCD: black window, teal rim, teal text
+      fillRect(viewBox_.buf, viewBox_.lw, viewBox_.lh, c.x, c.y, c.x + c.w, c.y + c.h, 0, 86, 75);
+      fillRect(viewBox_.buf, viewBox_.lw, viewBox_.lh, c.x + 1, c.y + 1, c.x + c.w - 1, c.y + c.h - 1, 0, 0, 0);
+      char buf[16];
+      std::snprintf(buf, sizeof buf, "C%d", kbLow_ / 12 - 1 + oct_.octave());
+      const uint8_t teal[3] = {0, 210, 185};
+      const int tw = ui::uiTextWidth(mono, buf);
+      ui::uiDrawText(viewBox_.buf.data(), viewBox_.lw, viewBox_.lh, c.x + (c.w - tw) / 2, c.y + c.h / 2 + 4, buf, teal, mono);
+    } else if (c.item == kMidi) {    // MIDI-in lamp (classic green LED)
+      const uint8_t dark[3] = {60, 60, 60};
+      ui::uiDrawText(viewBox_.buf.data(), viewBox_.lw, viewBox_.lh, c.x + 2, c.y + c.h / 2 + 4, "MIDI", dark, mono);
+      const int lx = c.x + 2 + ui::uiTextWidth(mono, "MIDI") + 8, ly = c.y + c.h / 2;
+      for (int dy = -4; dy <= 4; ++dy)
+        for (int dx = -4; dx <= 4; ++dx) {
+          const int d2 = dx * dx + dy * dy;
+          if (d2 > 20) continue;
+          if (d2 > 14) fillRect(viewBox_.buf, viewBox_.lw, viewBox_.lh, lx + dx, ly + dy, lx + dx + 1, ly + dy + 1, 60, 60, 60);
+          else if (midiLamp_) fillRect(viewBox_.buf, viewBox_.lw, viewBox_.lh, lx + dx, ly + dy, lx + dx + 1, ly + dy + 1, 40, 255, 40);
+          else fillRect(viewBox_.buf, viewBox_.lw, viewBox_.lh, lx + dx, ly + dy, lx + dx + 1, ly + dy + 1, 0, 72, 0);
+        }
+    }
+  }
+}
+
+void PanelView::paintBelow() {
+  const int W = kbLogicalW_, H = kbLogicalH_;
+  belowFrame_.assign((size_t)W * H * 4, 255);
+  if (kbVisible_) {
+    std::set<int> lit;
+    for (int n : kb_->activeNotes()) lit.insert(n);
+    kb_->render(W, H, lit, -1, belowFrame_.data());
+  } else {
+    fillRect(belowFrame_, W, H, 0, 0, W, H, 200, 200, 135);
+  }
 }
 
 void PanelView::composePanel(std::vector<uint8_t>& rgba) {
-  const int pw = panelW(), ph = panelH();
-  rgba.assign((size_t)pw * ph * 4, 0);
+  rgba.assign((size_t)panelW() * panelH() * 4, 0);
   panel_->render(rgba.data());
 }
 
@@ -119,28 +293,122 @@ void PanelView::blit(uint8_t* dst, int dw, int dh, int rowBytes) {
   composePanel(frame_);
   for (int y = 0; y < dh; ++y) {
     uint32_t* row = reinterpret_cast<uint32_t*>(dst + (size_t)y * rowBytes);
-    for (int x = 0; x < dw; ++x) row[x] = 0xFF000000u;   // opaque black (RGBA bytes 0,0,0,255)
+    for (int x = 0; x < dw; ++x) row[x] = kClear;
   }
-  replicate(dst, dw, dh, rowBytes, frame_.data(), panelW(), panelH(), panelR_.x, panelR_.y, mult_);
   const int k = nativeScale();
-  paintBar();
-  replicate(dst, dw, dh, rowBytes, barFrame_.data(), kbLogicalW_, kBarH, barR_.x, barR_.y, k);
-  kbFrame_.assign((size_t)kbLogicalW_ * kbLogicalH_ * 4, 0);
-  std::set<int> lit;
-  for (int n : kb_->activeNotes()) lit.insert(n);
-  kb_->render(kbLogicalW_, kbLogicalH_, lit, activeWheel_, kbFrame_.data());
-  replicate(dst, dw, dh, rowBytes, kbFrame_.data(), kbLogicalW_, kbLogicalH_, kbR_.x, kbR_.y, k);
+  replicate(dst, dw, dh, rowBytes, frame_.data(), panelW(), panelH(), panelR_.x, panelR_.y, mult_);
+  paintBoxes();
+  replicate(dst, dw, dh, rowBytes, wheelBox_.buf.data(), wheelBox_.lw, wheelBox_.lh, wheelBox_.px, wheelBox_.py, k);
+  replicate(dst, dw, dh, rowBytes, viewBox_.buf.data(), viewBox_.lw, viewBox_.lh, viewBox_.px, viewBox_.py, k);
+  if (belowR_.h > 0) {
+    paintBelow();
+    replicate(dst, dw, dh, rowBytes, belowFrame_.data(), kbLogicalW_, kbLogicalH_, belowR_.x, belowR_.y, k);
+    // the replicated frame can overhang the surface by < k px (clipped); nothing below belowR_ + h
+  }
+  drawWheels(dst, dw, dh, rowBytes);
+  drawInfo(dst, dw, dh, rowBytes);
   if (panel_->selectOpen()) {
     const int cw = panel_->selectClientWidth(), ch = panel_->selectClientHeight(), W = cw + 2, H = ch + 2;
     const auto fc = panel_->selectFrameColor();
-    selFrame_.assign((size_t)W * H * 4, 0);
-    for (size_t i = 0; i < selFrame_.size(); i += 4) {   // WS_BORDER frame colour
-      selFrame_[i] = (uint8_t)fc[0]; selFrame_[i + 1] = (uint8_t)fc[1]; selFrame_[i + 2] = (uint8_t)fc[2];
-    }
+    std::vector<uint8_t> sel((size_t)W * H * 4, 0);
+    for (size_t i = 0; i < sel.size(); i += 4) { sel[i] = (uint8_t)fc[0]; sel[i + 1] = (uint8_t)fc[1]; sel[i + 2] = (uint8_t)fc[2]; }
     const auto& cl = panel_->selectClient();
-    for (int y = 0; y < ch; ++y) std::memcpy(&selFrame_[((size_t)(y + 1) * W + 1) * 4], &cl[(size_t)y * cw * 4], (size_t)cw * 4);
+    for (int y = 0; y < ch; ++y) std::memcpy(&sel[((size_t)(y + 1) * W + 1) * 4], &cl[(size_t)y * cw * 4], (size_t)cw * 4);
     const Rect r = selectRect();
-    replicate(dst, dw, dh, rowBytes, selFrame_.data(), W, H, r.x, r.y, selScale_);
+    replicate(dst, dw, dh, rowBytes, sel.data(), W, H, r.x, r.y, selScale_);
+  }
+}
+
+// Wheels at native device resolution: dark well with ribs, light ribbed cap (classic palette of the
+// keyboard port's wheel design), anti-aliased. Pitch cap position from pitch_, mod from mod_.
+void PanelView::drawWheels(uint8_t* dst, int dw, int dh, int rowBytes) {
+  const uint8_t well[3] = {0x14, 0x14, 0x14}, edge[3] = {0x7c, 0x7c, 0x74}, ribA[3] = {0x24, 0x24, 0x24},
+                ribB[3] = {0x08, 0x08, 0x08}, capc[3] = {0xf7, 0xf7, 0xf3}, capHi[3] = {0x3d, 0x7e, 0xc4},
+                notch[3] = {0x8b, 0x8b, 0x84};
+  for (int i = 0; i < 2; ++i) {
+    const Rect r = wheelRc_[i];
+    const float x = (float)r.x, y = (float)r.y, w = (float)r.w, h = (float)r.h;
+    const float sw = std::max(1.2f, w * 0.03f), rad = std::max(3.f, w * 0.18f);
+    roundBox(dst, dw, dh, rowBytes, x, y, w, h, rad, well, 0);
+    const float pitch = std::max(4.f, w * 0.14f);
+    int n = 0;
+    for (float ry = y + sw + 2; ry + pitch * 0.45f < y + h - sw - 2; ry += pitch, ++n)
+      boxAA(dst, dw, dh, rowBytes, x + w * 0.12f, ry, x + w * 0.88f, ry + pitch * 0.45f, (n & 1) ? ribA : ribB);
+    roundBox(dst, dw, dh, rowBytes, x + sw / 2, y + sw / 2, w - sw, h - sw, rad, edge, sw);
+    if (i == 0) {   // pitch: centre notches on both sides
+      const float my = y + h / 2 - w * 0.12f;
+      boxAA(dst, dw, dh, rowBytes, x, my, x + sw * 1.5f, my + w * 0.24f, notch);
+      boxAA(dst, dw, dh, rowBytes, x + w - sw * 1.5f, my, x + w, my + w * 0.24f, notch);
+    }
+    const float capW = w * 0.80f, capH = w * 0.95f, pad = w * 0.08f;
+    const float travel = std::max(0.f, (h - capH) / 2 - pad);
+    const float t = i == 0 ? (pitch_ + 8192) / 16383.f : mod_ / 127.f;
+    const float cy = y + h / 2 - (2 * t - 1) * travel, cx = x + w / 2;
+    const bool act = activeWheel_ == i;
+    roundBox(dst, dw, dh, rowBytes, cx - capW / 2, cy - capH / 2, capW, capH, w * 0.14f, act ? capHi : capc, 0);
+    roundBox(dst, dw, dh, rowBytes, cx - capW / 2 + sw / 2, cy - capH / 2 + sw / 2, capW - sw, capH - sw, w * 0.14f, edge, sw);
+    for (int g = -1; g <= 1; ++g)
+      boxAA(dst, dw, dh, rowBytes, cx + g * capW * 0.2f - sw * 0.6f, cy - capH * 0.32f, cx + g * capW * 0.2f + sw * 0.6f,
+            cy + capH * 0.32f, (g == 0 && i == 0) ? notch : ribB);
+  }
+}
+
+// INFO overlay at a readable size (about 2 mm text), anti-aliased, over the keyboard area.
+void PanelView::drawInfo(uint8_t* dst, int dw, int dh, int rowBytes) {
+  if (!info_) return;
+  const double mmpx = dpi_ / 25.4;
+  int px = 0;
+  const auto& f = ui::uiFontRegularPx((int)std::lround(2.0 * mmpx), &px);
+  std::vector<std::string> lines;
+  size_t s = 0;
+  while (s <= infoText_.size()) {
+    size_t e = infoText_.find('|', s);
+    if (e == std::string::npos) e = infoText_.size();
+    std::string l = infoText_.substr(s, e - s);
+    while (!l.empty() && l.front() == ' ') l.erase(l.begin());
+    while (!l.empty() && l.back() == ' ') l.pop_back();
+    if (!l.empty()) lines.push_back(l);
+    s = e + 1;
+  }
+  int tw = 0;
+  for (auto& l : lines) tw = std::max(tw, ui::uiTextWidth(f, l));
+  const int pad = px / 2, lh = px * 5 / 4;
+  Rect a = belowR_;
+  const int bw = std::min(a.w - 2 * pad, tw + 2 * pad), bh = std::min(a.h - 2 * pad, (int)lines.size() * lh + pad);
+  if (bw <= 0 || bh <= 0) return;
+  const int bx = a.x + pad, by = a.y + pad;
+  std::vector<uint8_t> tmp((size_t)bw * bh * 4);
+  for (int y = 0; y < bh; ++y)
+    for (int x = 0; x < bw; ++x) {
+      const int sx = bx + x, sy = by + y;
+      uint8_t* t = &tmp[((size_t)y * bw + x) * 4];
+      if (sx < 0 || sy < 0 || sx >= dw || sy >= dh) { t[0] = t[1] = t[2] = 0; t[3] = 255; continue; }
+      const uint8_t* p = dst + (size_t)sy * rowBytes + (size_t)sx * 4;
+      t[0] = (uint8_t)((p[0] * 40 + 20 * 215) / 255); t[1] = (uint8_t)((p[1] * 40 + 20 * 215) / 255);
+      t[2] = (uint8_t)((p[2] * 40 + 24 * 215) / 255); t[3] = 255;
+    }
+  const uint8_t white[3] = {245, 245, 245};
+  int base = pad / 2 + f.ascent;
+  for (auto& l : lines) { ui::uiDrawText(tmp.data(), bw, bh, pad, base, l, white, f); base += lh; }
+  for (int y = 0; y < bh; ++y)
+    for (int x = 0; x < bw; ++x) {
+      const int sx = bx + x, sy = by + y;
+      if (sx < 0 || sy < 0 || sx >= dw || sy >= dh) continue;
+      std::memcpy(dst + (size_t)sy * rowBytes + (size_t)sx * 4, &tmp[((size_t)y * bw + x) * 4], 4);
+    }
+}
+
+void PanelView::setWheelFromY(int wheel, float sy) {
+  const Rect r = wheelRc_[wheel];
+  const float w = (float)r.w, capH = w * 0.95f, pad = w * 0.08f;
+  const float travel = std::max(1.f, (r.h - capH) / 2 - pad);
+  const float t = std::max(0.f, std::min(1.f, 0.5f + (r.y + r.h / 2.f - sy) / (2 * travel)));
+  if (wheel == 0) {
+    const int v = std::max(-8192, std::min(8191, (int)std::lround(-8192 + t * 16383)));
+    if (v != pitch_) { pitch_ = v; if (onPitchBend) onPitchBend(v); }
+  } else {
+    const int v = std::max(0, std::min(127, (int)std::lround(t * 127)));
+    if (v != mod_) { mod_ = v; if (onModWheel) onModWheel(v); }
   }
 }
 
@@ -162,32 +430,49 @@ bool PanelView::toPanel(float sx, float sy, int& px, int& py) const {
 void PanelView::releaseAll() {
   std::vector<int> ids;
   for (auto& kv : region_) ids.push_back(kv.first);
-  for (int id : ids) pointer(2, id, -100000.f, -100000.f);   // up far away: keys release, drags end
+  for (int id : ids) pointer(2, id, -100000.f, -100000.f);
+}
+
+void PanelView::doItem(Item it) {
+  switch (it) {
+    case kKbd: kbVisible_ = !kbVisible_; needRebuild_ = true; break;
+    case kInfo: info_ = !info_; break;
+    case kOctDown: oct_.step(-1); break;
+    case kOctUp: oct_.step(+1); break;
+    case kPanic:
+      kb_->allNotesOff();                                   // releases the touched keys (note-off events)
+      for (int n : oct_.releaseAll()) if (onNoteOff) onNoteOff(n);
+      if (onAllNotesOff) onAllNotesOff();
+      break;
+    default: break;
+  }
 }
 
 void PanelView::pointer(int action, int id, float sx, float sy, long long t) {
   if (action == 3) { releaseAll(); return; }
   const int k = nativeScale();
+  auto in = [](const Rect& r, float x, float y) { return x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h; };
   if (action == 0) {
     region_[id] = kNone;
     int x, y;
     const bool inside = toPanel(sx, sy, x, y);
     if (panel_->selectOpen()) {
-      const Rect sr = selectRect();
-      if (sx >= sr.x && sx < sr.x + sr.w && sy >= sr.y && sy < sr.y + sr.h) region_[id] = kSelect;
+      if (in(selectRect(), sx, sy)) region_[id] = kSelect;
       else panel_->selectDeactivate();            // click outside closes (WM_ACTIVATE 0), consumed
-    } else if (sx >= kbR_.x && sx < kbR_.x + kbR_.w && sy >= kbR_.y && sy < kbR_.y + kbR_.h) {
-      region_[id] = kKeys;
-    } else if (sx >= barR_.x && sx < barR_.x + barR_.w && sy >= barR_.y && sy < barR_.y + barR_.h) {
-      const float lx = (sx - barR_.x) / k, ly = (sy - barR_.y) / k;
-      int mx, px, bw;
-      barRects(mx, px, bw);
-      if (ly >= 2 && ly < kBarH - 2) {
-        if (lx >= mx && lx < mx + bw) { region_[id] = kBar; barBtn_[id] = 0; }
-        else if (lx >= px && lx < px + bw) { region_[id] = kBar; barBtn_[id] = 1; }
+    } else {
+      bool hit = false;
+      for (Item it : {kKbd, kInfo, kPanic, kOctDown, kOctUp})
+        if (in(itemRect(it), sx, sy)) { region_[id] = kButton; btn_[id] = it; hit = true; break; }
+      if (!hit && kbVisible_ && in(belowR_, sx, sy)) { region_[id] = kKeys; hit = true; }
+      if (!hit) {
+        for (int i = 0; i < 2 && !hit; ++i) {
+          const Rect r = wheelRc_[i];
+          if (sx >= r.x - r.w * 0.25f && sx < r.x + r.w * 1.25f && sy >= r.y && sy < r.y + r.h) {
+            region_[id] = kWheel; heldWheel_[id] = i; activeWheel_ = i; hit = true;
+          }
+        }
       }
-    } else if (inside) {
-      region_[id] = kPanel;
+      if (!hit && inside) region_[id] = kPanel;
     }
   }
   auto it = region_.find(id);
@@ -198,7 +483,7 @@ void PanelView::pointer(int action, int id, float sx, float sy, long long t) {
   switch (r) {
     case kPanel:
       if (action == 0) panel_->pointerDown(id, x, y, t);
-      else if (action == 1) panel_->pointerMove(id, x, y, t);   // drags continue outside the rect
+      else if (action == 1) panel_->pointerMove(id, x, y, t);
       else panel_->pointerUp(id, x, y, t);
       break;
     case kSelect: {
@@ -212,26 +497,36 @@ void PanelView::pointer(int action, int id, float sx, float sy, long long t) {
       break;
     }
     case kKeys: {
-      const double kx = (sx - kbR_.x) / (double)k, ky = (sy - kbR_.y) / (double)k;
-      if (action == 0) { activeWheel_ = kb_->wheelAt(kx, ky); kb_->press(id, kx, ky); }
+      const double kx = (sx - belowR_.x) / (double)k, ky = (sy - belowR_.y) / (double)k;
+      if (action == 0) kb_->press(id, kx, ky);
       else if (action == 1) kb_->move(id, kx, ky);
-      else { kb_->release(id); activeWheel_ = -1; }
+      else kb_->release(id);
       break;
     }
-    case kBar:
+    case kWheel: {
+      const int wi = heldWheel_[id];
       if (action == 2) {
-        const int which = barBtn_[id];
-        const float lx = (sx - barR_.x) / k, ly = (sy - barR_.y) / k;
-        int mx, px, bw;
-        barRects(mx, px, bw);
-        const int bx = which == 0 ? mx : px;
-        if (lx >= bx && lx < bx + bw && ly >= 2 && ly < kBarH - 2) oct_.step(which == 0 ? -1 : 1);
-        barBtn_.erase(id);
+        heldWheel_.erase(id);
+        bool still = false;
+        for (auto& kv : heldWheel_) if (kv.second == wi) still = true;
+        if (!still && wi == 0 && pitch_ != 0) { pitch_ = 0; if (onPitchBend) onPitchBend(0); }   // pitch springs back
+        if (!still && activeWheel_ == wi) activeWheel_ = -1;
+      } else {
+        setWheelFromY(wi, sy);
+      }
+      break;
+    }
+    case kButton:
+      if (action == 2) {
+        const Item bi = (Item)btn_[id];
+        btn_.erase(id);
+        if (in(itemRect(bi), sx, sy)) doItem(bi);
       }
       break;
     default: break;
   }
   if (action == 2) region_.erase(id);
+  if (needRebuild_) { std::string e; needRebuild_ = false; rebuild(e); }
 }
 
 }  // namespace synth1_android

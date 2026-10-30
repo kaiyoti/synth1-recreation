@@ -27,9 +27,10 @@ Computer keyboard: Z..M / Q..P rows play notes, `-` / `=` (or the octave buttons
 
 ## Android
 Download the APK from [Releases](https://github.com/kaiyoti/synth1-recreation/releases) and install it (allow installs from unknown
-sources). Android 8.0+ (arm64 or x86_64); USB MIDI input needs Android 10+. Same skins and banks
-as the web edition, the panel at the largest integer scale that fits, keyboard with wheels and
-octave shift below it.
+sources). Android 8.0+ (arm64 or x86_64); USB MIDI input needs Android 10+. Classic skin and the same
+banks as the web edition: the panel at the largest whole-number scale that fits, side columns
+with the pitch/mod wheels and the view buttons (keyboard on/off, octave, panic, MIDI lamp), and a
+full-width keyboard sized to your screen (about 3 octaves on a phone).
 
 Build it yourself (JDK 17+, Android SDK with platform 35, build-tools 35.0.0, NDK 27.2.12479018,
 CMake 3.22.1):
@@ -38,7 +39,7 @@ CMake 3.22.1):
 cd native/android
 ./gradlew assembleDebug          # app/build/outputs/apk/debug/app-debug.apk
 ```
-The build packs the skins from `web/skins/{classic,s80}` and the banks listed in their
+The build packs the classic skin from `web/skins/classic` and the banks listed in their
 `banks.json`. A release build is signed only when `~/.synth1-android-release/keystore.properties`
 (or `$S1_KEYSTORE_PROPS`) exists; otherwise it is unsigned.
 
