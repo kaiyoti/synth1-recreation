@@ -1,0 +1,26 @@
+# Linux host build of the shell's native render entry (gate 3b).
+#   cmake -S portable-synth/android/host -B portable-synth/android/host/build && cmake --build ... -j2
+cmake_minimum_required(VERSION 3.16)
+project(synth1_android_host CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+include(${CMAKE_CURRENT_SOURCE_DIR}/../synth1_core_sources.cmake)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -ffp-contract=off")
+add_library(s1_core STATIC ${S1_CORE_SOURCES})
+target_include_directories(s1_core PUBLIC ${S1_CORE})
+add_executable(synth1_render_cli ../app/src/main/cpp/render_cli.cpp ../app/src/main/cpp/synth_host.cpp)
+target_link_libraries(synth1_render_cli s1_core)
+
+# presentation + input checks (gates C and D)
+add_subdirectory(${S1_ROOT}/panel ${CMAKE_BINARY_DIR}/panel)
+add_library(s1_keyboard STATIC ${S1_ROOT}/keyboard/keyboard.cpp)
+target_include_directories(s1_keyboard PUBLIC ${S1_ROOT}/keyboard)
+set(APPCPP ../app/src/main/cpp)
+add_executable(panel_view_test ${APPCPP}/panel_view_test.cpp ${APPCPP}/panel_view.cpp ${APPCPP}/input_router.cpp)
+target_link_libraries(panel_view_test synth1_panel s1_keyboard)
+add_executable(input_router_test ${APPCPP}/input_router_test.cpp ${APPCPP}/panel_view.cpp
+               ${APPCPP}/input_router.cpp ${APPCPP}/synth_host.cpp)
+target_link_libraries(input_router_test synth1_panel s1_keyboard s1_core)
+target_include_directories(panel_view_test PRIVATE ${APPCPP})
+target_include_directories(input_router_test PRIVATE ${APPCPP})

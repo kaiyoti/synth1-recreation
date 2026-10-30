@@ -1,10 +1,12 @@
-# Synth1 Recreation — Kaiyoti Web Edition
+# Synth1 Recreation — Kaiyoti Edition
 
-A browser recreation of **Synth1**, the classic free virtual-analog synthesizer by **Ichiro Toda
+A browser and Android recreation of **Synth1**, the classic free virtual-analog synthesizer by **Ichiro Toda
 (Daichi)**. This project is not affiliated with or endorsed by the original author.
 
 - `web/` — the playable synth: an editor with artwork drawn in code (no original bitmaps), an on-screen keyboard with pitch/mod wheels, Web MIDI input, and the sound engine
   compiled to WebAssembly.
+- `native/` — the Android app (`native/android`) and the C++ code it is built from: the sound
+  engine (`core`), the panel renderer (`panel`) and the on-screen keyboard (`keyboard`).
 - `banks/` — Synth1 bank folders (`NNN.sy1`), usable in the original plugin too: `00 Factory` is
   Synth1's stock bank, unchanged; 01–11 are the Kaiyoti sound library.
 
@@ -22,6 +24,23 @@ http on another host the engine falls back to the main thread.
 URL options: `?scale=1|2|3` (panel zoom, default 2), `?skin=classic|s80` (default `classic`),
 `?buf=256|512|1024` (main-thread audio buffer, plain-http fallback only).
 Computer keyboard: Z..M / Q..P rows play notes, `-` / `=` (or the octave buttons) shift octaves.
+
+## Android
+Download the APK from [Releases](https://github.com/kaiyoti/synth1-recreation/releases) and install it (allow installs from unknown
+sources). Android 8.0+ (arm64 or x86_64); USB MIDI input needs Android 10+. Same skins and banks
+as the web edition, the panel at the largest integer scale that fits, keyboard with wheels and
+octave shift below it.
+
+Build it yourself (JDK 17+, Android SDK with platform 35, build-tools 35.0.0, NDK 27.2.12479018,
+CMake 3.22.1):
+
+```sh
+cd native/android
+./gradlew assembleDebug          # app/build/outputs/apk/debug/app-debug.apk
+```
+The build packs the skins from `web/skins/{classic,s80}` and the banks listed in their
+`banks.json`. A release build is signed only when `~/.synth1-android-release/keystore.properties`
+(or `$S1_KEYSTORE_PROPS`) exists; otherwise it is unsigned.
 
 ## Banks
 | Bank | Contents |
@@ -46,3 +65,9 @@ MIT, see [LICENSE](LICENSE). Synth1 itself is the work of Ichiro Toda; this
 licence covers only this recreation (code, artwork and patch banks 01–11). Bank 00 is the stock
 Synth1 factory bank, included unchanged; it belongs to its original authors and is not covered
 by the MIT licence.
+
+Third-party code and data: Oboe (`native/android/third_party/oboe`, Apache-2.0, its own LICENSE);
+DejaVu fonts (Bitstream Vera licence) for the label glyphs drawn into the skins and the built-in
+UI bitmap font.
+
+See [CHANGELOG.md](CHANGELOG.md) for release notes.

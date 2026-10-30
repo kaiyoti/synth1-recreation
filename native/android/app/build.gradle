@@ -1,0 +1,61 @@
+plugins { id 'com.android.application' }
+
+// Skins = DATA shipped as APK assets, from the PUBLIC repo (drawn skins only, never the captured
+// originals): public/web/skins/{classic,s80}/{assets -> 100, assets200 -> 200} -> skin/<name>/{100,200}.
+// All 12 banks live in each skin's banks.json (names/colours); the 20 protocol presets of
+// public/banks/00 Factory are staged for the adb render hook. Staged by a Copy task.
+// public repo layout (web/skins/{classic,s80}, banks/): -Ps1.public=<dir> or the repo root (default)
+def publicDir = file(findProperty("s1.public") ?: "${rootDir}/../..")
+
+// release keystore: read BY PATH from outside the repo (never committed)
+def ksProps = new Properties()
+def ksFile = file(System.getenv("S1_KEYSTORE_PROPS") ?: "${System.getProperty("user.home")}/.synth1-android-release/keystore.properties")
+if (ksFile.exists()) ksFile.withInputStream { ksProps.load(it) }
+def stagedAssets = layout.buildDirectory.dir("staged_assets")
+tasks.register('stageAssets', Copy) {
+    into stagedAssets
+    ['classic', 's80'].each { skin ->
+        from("${publicDir}/web/skins/${skin}/assets") { into "skin/${skin}/100" }
+        from("${publicDir}/web/skins/${skin}/assets200") { into "skin/${skin}/200" }
+    }
+    from("${publicDir}/banks/00 Factory") {
+        include '001.sy1','002.sy1','005.sy1','012.sy1','020.sy1','039.sy1','048.sy1','051.sy1','062.sy1',
+                '073.sy1','083.sy1','092.sy1','103.sy1','111.sy1','112.sy1','114.sy1','116.sy1','121.sy1',
+                '123.sy1','128.sy1'
+        into 'presets'
+    }
+}
+
+android {
+    namespace 'org.synth1.android'
+    compileSdk 35
+    ndkVersion '27.2.12479018'
+    defaultConfig {
+        applicationId 'com.kaiyoti.synth1'
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName '1.0.0'
+        ndk { abiFilters 'arm64-v8a', 'x86_64' }
+        externalNativeBuild { cmake { arguments '-DANDROID_STL=c++_static'; cppFlags '' } }
+    }
+    signingConfigs {
+        if (ksProps.getProperty('storeFile')) release {
+            storeFile file(ksProps.getProperty('storeFile'))
+            storePassword ksProps.getProperty('storePassword')
+            keyAlias ksProps.getProperty('keyAlias')
+            keyPassword ksProps.getProperty('keyPassword')
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (ksProps.getProperty('storeFile')) signingConfig signingConfigs.release
+        }
+    }
+    externalNativeBuild { cmake { path 'src/main/cpp/CMakeLists.txt'; version '3.22.1' } }
+    sourceSets { main { assets.srcDirs = [stagedAssets] } }
+    compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+    packaging { jniLibs { useLegacyPackaging false } }
+}
+tasks.matching { (it.name.startsWith('merge') && it.name.endsWith('Assets')) || it.name.toLowerCase().contains('lint') }.configureEach { dependsOn 'stageAssets' }

@@ -2,3 +2,13 @@
 *.pyc
 __pycache__/
 node_modules/
+# Android / native build output and local config
+native/android/.gradle/
+native/android/build/
+native/android/app/build/
+native/android/app/.cxx/
+native/android/host/build/
+native/android/local.properties
+*.jks
+*.keystore
+keystore.properties

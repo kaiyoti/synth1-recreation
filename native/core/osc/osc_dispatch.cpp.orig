@@ -1,0 +1,229 @@
+// osc_dispatch.cpp — CVco oscillator engine: kernel dispatch + dual-osc render.
+//
+// Spec: kernel_map.md §2 (leaf bijection), §4 (amplitude compensation),
+//       §8 (arg frame / phase arithmetic); spec_osc.md §6.1 (canonical
+//       kernel: osc2 term first, osc1 term second, sub third, then the
+//       phase accumulators advance), §6.2 (pulse = difference of two
+//       interpolated saw reads at index offset dutyIdx), §6.3 (noise: 21-bit
+//       Galois LFSR, not phase-locked, osc2 phase still advances), §6.4 (sub
+//       at ph1 >> subOct), §6.5 (hard sync: proportional restart from the
+//       pre-increment ph1 — the division is the giveaway), §6.6 (ring:
+//       out = v2·g2·v1 + g1·v1).
+
+#include "osc_dispatch.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdlib>
+
+namespace synth1::osc {
+
+namespace {
+// COSRAMP (DAT_1801a32e0): (1 + cos(i·π/257))·0.5, 256 doubles. Index 256
+// (the first lookup, rem == rampTotal) reads zeroed BSS → 0.0, so the ramp
+// starts exactly at rampStart (spec_osc.md §6.7).
+const double* cosramp() {
+  static const std::array<double, 256> table = [] {
+    std::array<double, 256> t{};
+    for (int i = 0; i < 256; ++i)
+      t[i] = (1.0 + std::cos(i * 3.14159265358979311599796346854418516 / 257.0)) * 0.5;
+    return t;
+  }();
+  return table.data();
+}
+}  // namespace
+
+int compute_kernel_leaf(const OscParams& p) {
+  const int sync = p.sync ? 1 : 0;
+  const int pulse = (p.osc1_wave == 2) ? 1 : 0;
+  const int osc2_class = (p.osc2_wave == 2) ? 0 : (p.osc2_wave == 4 ? 1 : 2);
+  const int g = p.ring
+                    ? (4 + (p.unison ? 1 : 0))
+                    : ((p.fm_active ? 1 : 0) * 2 + (p.unison ? 1 : 0));
+  return sync * 36 + g * 6 + (1 - pulse) * 3 + osc2_class;
+}
+
+void apply_amplitude_compensation(OscParams& p) {
+  // kernel_map.md §4, verbatim order.
+  if (p.osc1_wave == 2 && !p.ring) {
+    p.osc1_gain *= 0.5f;  // DAT_180072b60 (kernel_map §4: gated on ring==0)
+  }
+  if (p.unison && !p.ring) {
+    p.osc1_gain *= 0.3f;  // DAT_180072b5c
+    p.sub_gain *= 0.3f;   // DAT_180072b5c
+  }
+  if ((p.osc2_wave == 2 || p.osc2_wave == 4) && !p.fm_active) {
+    p.osc2_gain *= 0.65f;  // DAT_180077210
+  }
+}
+
+int pulse_duty_index(float pulse_width, int pw_mod) {
+  // spec_osc.md §6.2 / spec_env.md §5.5 (DAT_1800755a8 = 1/128); clamp
+  // [0.01, 1.99] (DAT_180073398 / DAT_180077378); ×1024.0 (DAT_180077390).
+  float d;
+  if (pw_mod < 1) {
+    d = ((float)pw_mod * (1.0f / 128.0f) + 1.0f) * pulse_width;
+  } else {
+    d = (2.0f - pulse_width) * (float)pw_mod * (1.0f / 128.0f) + pulse_width;
+  }
+  d = std::clamp(d, 0.01f, 1.99f);
+  return (int)((double)d * 1024.0);
+}
+
+void render_oscillators(const OscParams& params,
+                        const float* osc1_table, const float* osc2_table,
+                        const float* sub_table,
+                        float* output, int num_samples,
+                        std::int32_t inc1, std::int32_t inc2,
+                        OscState& state) {
+  OscParams p = params;
+
+  // spec_osc.md §6.7: FM depth ramp state machine (FUN_18003bf50), run once
+  // per render call (the device runs it per env sub-chunk). p.fm_depth is
+  // the TARGET; the current depth lives in state.fm. The dispatcher's
+  // FMactive flag (kernel selection + the osc2 pulse/noise ×0.65 rule) is
+  // (depth != 0 || target != 0) AFTER the state machine — not the caller's
+  // target-only fm_active — so a ramping-down depth keeps the FM kernel.
+  FmRampState& fm = state.fm;
+  const int fm_target = p.fm_depth;
+  if (fm.last_target != fm_target) {
+    const long long delta = (long long)fm.depth - fm_target;
+    if (std::llabs(delta) < 0x4000001LL && fm.flag == 0) {
+      if (fm.total <= fm.block_cur) {
+        fm.total = fm.block_cur;   // ramp duration = time the old target held
+        fm.rem = fm.block_cur;
+        fm.start = fm.depth;
+      }
+    } else {
+      // FUN_18003bf50: the snap is an 8-byte zero store at cv+0xb8 — it
+      // clears BOTH flag (0xb8) and rampTotal (0xbc) — then depth = target.
+      fm.flag = 0;
+      fm.total = 0;
+      fm.depth = fm_target;        // big jump: snap
+    }
+    if (fm.rem == 0) fm.depth = fm_target;
+    fm.block_cur = 0;
+    fm.last_target = fm_target;
+  }
+  const int ramp_max = p.sample_rate / 1000;  // cv+0x160 = sr/1000
+  if (fm.block_cur < ramp_max)
+    fm.block_cur = std::min(fm.block_cur + num_samples, ramp_max);
+  const bool fm_on = (fm.depth != 0) || (fm_target != 0);
+  p.fm_active = fm_on;
+  apply_amplitude_compensation(p);
+
+  const bool pulse = (p.osc1_wave == 2);
+  const bool pulse2 = (p.osc2_wave == 2);
+  const bool noise = (p.osc2_wave == 4);
+  const std::uint32_t duty_idx =
+      static_cast<std::uint32_t>(pulse_duty_index(p.pulse_width, p.pw_mod));
+  const std::uint32_t duty = duty_idx << 16;
+  // d→0 sawtooth limit: at the lower duty clamp the two-saw difference
+  // saw(ph)−saw(ph+dutyIdx) degenerates to dutyIdx·saw′(ph), a flat-spectrum
+  // (HF-boosted) derivative — an alias explosion the device does not produce
+  // (device p8=0 is tonal). Below this index the pulse opens to the plain saw.
+  const bool pulse_saw_limit = (duty_idx < 24u);
+
+  std::uint32_t ph1 = state.osc1_phase;
+  std::uint32_t ph2 = state.osc2_phase;
+  tables::LfsrNoise lfsr(state.lfsr);
+
+  for (int i = 0; i < num_samples; ++i) {
+    // spec_osc.md §6.1: osc2 term first, osc1 term second, sub added third,
+    // then the phase accumulators advance — sample n uses the phase left by
+    // sample n−1.
+    float v2 = noise ? lfsr.next()
+                     : (osc2_table ? tables::read(osc2_table, ph2) : 0.0f);
+    if (pulse2 && osc2_table) {
+      // §6.2 / FUN_180051db0: osc2 pulse = saw(ph2) − saw(ph2 + dutyIdx).
+      v2 -= tables::read(osc2_table, ph2 + duty);
+    }
+    if (fm_on) {
+      // FM-kernel modulator amplitude (FUN_18004ade0 noise: the LFSR sample
+      // is ±0.65 — DAT_180077418/DAT_180077210 — not ±1; FUN_18004b180/
+      // FUN_18004bc10 pulse: the saw difference is ×0.5 — DAT_180072b60).
+      // The dispatcher's osc2 ×0.65 compensation is skipped while FM is on,
+      // so the scaling lives in the kernel and feeds BOTH the audible osc2
+      // term and the phase-modulation term.
+      if (noise) v2 *= 0.65f;
+      else if (pulse2) v2 *= 0.5f;
+    }
+    float v1 = osc1_table ? tables::read(osc1_table, ph1) : 0.0f;
+    if (pulse && osc1_table && !pulse_saw_limit) {
+      // §6.2: pulse(p) = saw(p) − saw(p + dutyIdx), same interp fraction:
+      // the second read is the same phase with the index window shifted.
+      v1 -= tables::read(osc1_table, ph1 + duty);
+    }
+
+    float out;
+    if (p.ring) {
+      // §6.6: out = v2·g2·v1 + g1·v1 (multiplicative osc2 term).
+      out = 0.5f * (v2 * p.osc2_gain * v1 + p.osc1_gain * v1);
+    } else {
+      out = v2 * p.osc2_gain + v1 * p.osc1_gain;
+    }
+
+    // §6.4: sub oscillator at the same osc1 phase, or phase >> 1 / >> 2 for
+    // the −1 / −2 octave modes. Added after the osc mix, unchanged by ring.
+    switch (p.sub_oct) {
+      case 1: out += tables::read(sub_table, ph1) * p.sub_gain; break;
+      case 2: out += tables::read(sub_table, ph1 >> 1) * p.sub_gain; break;
+      case 3: out += tables::read(sub_table, ph1 >> 2) * p.sub_gain; break;
+      default: break;
+    }
+    output[i] = out;
+
+    // §6.7 FM: osc2's raw waveform phase-modulates osc1 inside the phase
+    // accumulator. The depth follows the COSRAMP raised-cosine ramp:
+    // re-evaluated every 32 samples (rem & 0x1f == 0, rem before decrement),
+    // rem-- each sample, snap to target at rem == 0 (the device truncates the
+    // sub-chunk there).
+    std::int32_t fm_inc = 0;
+    if (fm_on) {
+      if (fm.depth != fm_target) {
+        if (fm.rem > 0) {
+          if ((fm.rem & 0x1f) == 0) {
+            const int idx = (fm.rem << 8) / fm.total;
+            const double c = (idx >= 0 && idx < 256) ? cosramp()[idx] : 0.0;
+            fm.depth = (int)((double)(fm_target - fm.start) * c) + fm.start;
+          }
+          --fm.rem;
+        } else {
+          fm.depth = fm_target;
+        }
+      }
+      fm_inc = (std::int32_t)((float)fm.depth * v2);
+    }
+    // §6.5 hard sync. Non-noise osc2 (pulse/saw/tri, incl. FM): proportional
+    // restart from the pre-increment ph1 when osc1's 27-bit window wraps this
+    // sample — FUN_1800486c0/48390/402f0: slavePhase = (ph1 & 0x7ffffff)*inc2 /
+    // inc1 (the divide is the giveaway; the denominator is inc1, not inc1+fm_inc).
+    // Noise osc2 (FUN_180047760/3e8f0): the osc2 accumulator is NEVER advanced
+    // and hard sync re-seeds the LFSR to 10 (cv+0x134, *puVar3 = 10) on the
+    // master wrap instead of restarting a phase — noise is not phase-locked.
+    const std::uint32_t ph1n = ph1 + (std::uint32_t)(inc1 + fm_inc);
+    const bool master_wrap = (ph1n & 0x7ffffffu) < (ph1 & 0x7ffffffu);
+    if (noise) {
+      // Per-kernel re-seed matrix (audited 12 re-seed sites in decomp_all.c:
+      // 3e8f0,3fd70,40eb0,41a20,424d0,43660,44510,44ec0,45790,46920,47760,480f0
+      // — all in the sync!=0 dispatcher branch, cv+0x118). The sync==0 noise
+      // kernels (4ade0 = 126 FM noise, 51230 = FM-off noise) have NO re-seed
+      // and NO 0x7ffffff wrap test at all. So re-seed iff osc2 sync is on:
+      // inside a sync noise kernel the re-seed is unconditional per wrap.
+      if (p.sync && master_wrap) lfsr.s = 10u;  // *puVar = 10
+    } else if (p.sync && master_wrap) {
+      ph2 = (std::uint32_t)(((std::uint64_t)(ph1 & 0x7ffffffu) *
+                             (std::uint32_t)inc2) / (std::uint32_t)inc1);
+    } else {
+      ph2 += (std::uint32_t)inc2;
+    }
+    ph1 = ph1n;
+  }
+
+  state.osc1_phase = ph1;
+  state.osc2_phase = ph2;
+  state.lfsr = lfsr.s;
+}
+
+}  // namespace synth1::osc
