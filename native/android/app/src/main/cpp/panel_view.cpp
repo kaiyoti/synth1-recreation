@@ -75,8 +75,6 @@ void boxAA(uint8_t* dst, int dw, int dh, int rowBytes, float x0, float y0, float
 }
 }  // namespace
 
-PanelView::Rect PanelView::Box::rect() const { return {px, py, lw * scale, lh * scale}; }
-
 bool PanelView::init(const std::string& root, int w, int h, std::string& err, bool kbVisible, float dpi) {
   root_ = root; surfW_ = w; surfH_ = h; kbVisible_ = kbVisible; dpi_ = dpi;
   int w1 = kPanelW, h1 = kPanelH;
@@ -85,19 +83,16 @@ bool PanelView::init(const std::string& root, int w, int h, std::string& err, bo
     std::string e;
     if (probe.load(root + "/200", 2, e)) { w1 = probe.width() / 2; h1 = probe.height() / 2; }
   }
-  // ---- orientation + integer scale k ----
-  landscape_ = w >= h && w >= w1 + kMinWheelCol + kMinViewCol;
+  const double mmpx = dpi / 25.4;
+  // ---- orientation + the largest integer scale that fits the WHOLE screen ----
+  landscape_ = w >= h && w >= w1 + 2 * kMinColW;
   int k = 1;
   if (landscape_) {
-    const int minKb = std::max((int)std::ceil(0.30 * h), 250);
-    for (int c = std::min(w / w1, h / h1); c >= 1; --c) {
-      const bool widthOk = w - w1 * c >= (kMinWheelCol + kMinViewCol) * c;
-      const bool kbOk = !kbVisible || h - h1 * c >= minKb;
-      if (widthOk && kbOk) { k = c; break; }
-    }
+    for (int c = std::min(w / w1, h / h1); c >= 1; --c)
+      if (w - w1 * c >= 2 * kMinColW * c) { k = c; break; }
   } else {
     k = std::max(1, w / w1);
-    while (k > 1 && (h1 + kStripH) * k + (kbVisible ? 56 * k : 0) > h) --k;
+    while (k > 1 && h1 * k > h) --k;
   }
   skin_ = (k % 2 == 0) ? 2 : 1;
   mult_ = k / skin_;
@@ -108,54 +103,55 @@ bool PanelView::init(const std::string& root, int w, int h, std::string& err, bo
   selScale_ = std::max(1, std::min(w / (panel_->selectClientWidth() + 2), h / (panel_->selectClientHeight() + 2)));
 
   // ---- geometry (surface px) ----
-  const double mmpx = dpi / 25.4;
   const int pwk = w1 * k, phk = h1 * k;
-  wheelBox_.scale = viewBox_.scale = k;
-  int belowY, belowH;
-  double ww;                                  // wheel width (px): <= 12 mm, centred in the WHEEL box
+  boxL_.scale = boxR_.scale = k;
+  int kbH;
   if (landscape_) {
+    kbH = (int)std::max(0.40 * h, 250.0);
+    overlay_ = true;
     const int leftover = w - pwk, lpx = leftover / 2, rpx = leftover - lpx;
-    panelR_ = {lpx, 0, pwk, phk};
-    wheelBox_.lw = (lpx + k - 1) / k; wheelBox_.lh = h1; wheelBox_.px = lpx - wheelBox_.lw * k; wheelBox_.py = 0;
-    viewBox_.lw = (rpx + k - 1) / k; viewBox_.lh = h1; viewBox_.px = lpx + pwk; viewBox_.py = 0;
-    belowY = phk; belowH = h - phk;
-    ww = std::min({12.0 * mmpx, lpx / 3.2, (h1 - kHeaderH - 8) * (double)k * 0.22});
+    const int py0 = (h - phk) / 2;                                   // panel centred vertically
+    panelR_ = {lpx, py0, pwk, phk};
+    boxL_.lw = (lpx + k - 1) / k; boxL_.lh = (h + k - 1) / k; boxL_.px = lpx - boxL_.lw * k; boxL_.py = 0;
+    boxR_.lw = (rpx + k - 1) / k; boxR_.lh = boxL_.lh; boxR_.px = lpx + pwk; boxR_.py = 0;
+    ovR_ = {0, h - kbH, w, kbH};
   } else {
-    panelR_ = {(w - pwk) / 2, 0, pwk, phk};
-    ww = std::min(12.0 * mmpx, (kStripH - kHeaderH - 8) * (double)k * 0.42);
-    wheelBox_.lw = (int)std::ceil(2.6 * ww / k) + 6; wheelBox_.lh = kStripH; wheelBox_.px = 0; wheelBox_.py = phk;
-    viewBox_.px = (wheelBox_.lw + 3) * k; viewBox_.lw = (w - viewBox_.px + k - 1) / k; viewBox_.lh = kStripH; viewBox_.py = phk;
-    belowY = phk + kStripH * k;
-    const int kbPx = (int)std::max(250.0, 32.0 * mmpx);       // a normal keyboard height (~32 mm)
-    belowH = std::max(0, std::min(h - belowY, kbPx));
+    kbH = (int)std::max(250.0, 32.0 * mmpx);                         // a normal keyboard height (~32 mm)
+    const int block = phk + kStripH * k + kbH;
+    overlay_ = block > h;
+    const int y0 = overlay_ ? 0 : (h - block) / 2;
+    panelR_ = {(w - pwk) / 2, y0, pwk, phk};
+    boxL_.lw = 0; boxL_.lh = 0; boxL_.px = 0; boxL_.py = 0;
+    boxR_.px = 0; boxR_.py = y0 + phk; boxR_.lw = (w + k - 1) / k; boxR_.lh = kStripH;
+    ovR_ = overlay_ ? Rect{0, h - kbH, w, kbH} : Rect{0, boxR_.py + kStripH * k, w, kbH};
+    if (ovR_.y + ovR_.h > h) ovR_.h = std::max(0, h - ovR_.y);
   }
-  belowR_ = {0, belowY, w, belowH};
-  wheelBox_.buf.assign((size_t)wheelBox_.lw * wheelBox_.lh * 4, 0);
-  viewBox_.buf.assign((size_t)viewBox_.lw * viewBox_.lh * 4, 0);
+  boxL_.title = "KEYS"; boxR_.title = "VIEW";
+  boxL_.buf.assign((size_t)boxL_.lw * boxL_.lh * 4, 0);
+  boxR_.buf.assign((size_t)boxR_.lw * boxR_.lh * 4, 0);
+
+  // ---- overlay content: wheels (<= 12 mm each) at the left end, keys (~6.5 mm white keys) ----
   {
-    const int iww = std::max(8, (int)ww), gap = iww / 2, pair = 2 * iww + gap;
-    const int bx = wheelBox_.px, bw = wheelBox_.lw * k;
-    const int y0 = wheelBox_.py + (kHeaderH + 4) * k, hh = (wheelBox_.lh - kHeaderH - 8) * k;
-    const int x0 = bx + (bw - pair) / 2;
-    wheelRc_[0] = {x0, y0, iww, hh};
-    wheelRc_[1] = {x0 + iww + gap, y0, iww, hh};
-    wheelR_ = {x0, y0, pair, hh};
-  }
-  // ---- keyboard: whole octaves, white keys ~9 mm ----
-  kbLogicalW_ = (w + k - 1) / k;
-  kbLogicalH_ = std::max(8, (belowH + k - 1) / k);
-  {
-    const double keyPx = 6.5 * dpi / 25.4;   // white key target 6.5 mm
-    octaves_ = std::max(1, std::min(8, (int)std::lround((w / keyPx) / 7.0)));
+    const double ww = std::min(12.0 * mmpx, 0.26 * ovR_.h);
+    const int iww = std::max(8, (int)ww), gap = iww / 2, pad = std::max(4, iww * 3 / 10);
+    const int wl = 2 * iww + gap + 2 * pad + pad / 2;
+    const int y0 = ovR_.y + ovBorder_ + pad, hh = std::max(8, ovR_.h - ovBorder_ - 2 * pad);
+    wheelRc_[0] = {ovR_.x + pad, y0, iww, hh};
+    wheelRc_[1] = {ovR_.x + pad + iww + gap, y0, iww, hh};
+    keysR_ = {ovR_.x + wl, ovR_.y + ovBorder_, ovR_.w - wl, ovR_.h - ovBorder_};
+    kbLogicalW_ = (keysR_.w + k - 1) / k;
+    kbLogicalH_ = std::max(8, (keysR_.h + k - 1) / k);
+    const double keyPx = 6.5 * mmpx;
+    octaves_ = std::max(1, std::min(8, (int)std::lround((keysR_.w / keyPx) / 7.0)));
     kbLow_ = 60 - 12 * (octaves_ / 2);
     synth1::keyboard::Keyboard::Options o;
     o.low = kbLow_; o.high = kbLow_ + 12 * octaves_; o.height = kbLogicalH_; o.wheels = false;
     kb_.reset(new synth1::keyboard::Keyboard(o));
     kb_->layout(kbLogicalW_, kbLogicalH_);
   }
-  wireKeyboards();
+  wireKeyboard();
   layoutCells();
-  region_.clear(); btn_.clear(); activeWheel_ = -1; needRebuild_ = false;
+  region_.clear(); btn_.clear(); heldWheel_.clear(); activeWheel_ = -1;
   return true;
 }
 
@@ -171,43 +167,44 @@ bool PanelView::rebuild(std::string& err) {
   return true;
 }
 
-void PanelView::wireKeyboards() {
+void PanelView::wireKeyboard() {
   kb_->onNoteOn = [this](int n, int v) { const int e = oct_.noteOn(n); if (onNoteOn) onNoteOn(e, v); };
   kb_->onNoteOff = [this](int n) { const int e = oct_.noteOff(n); if (onNoteOff) onNoteOff(e); };
 }
 
-// VIEW column grid. Landscape: 1..3 columns by width; portrait strip: 4 columns x 2 rows.
+// Buttons: landscape: VIEW column (right) = KBD, INFO, PANIC; KEYS column (left) = OCT -, readout,
+// OCT +, MIDI lamp; portrait: one strip with all of them. Always above the overlay's top edge.
 void PanelView::layoutCells() {
   cells_.clear();
-  const int lw = viewBox_.lw, gap = 4, m = 6, pitch = 24;
-  const int top = landscape_ ? kHeaderH + 6 : kHeaderH + std::max(4, (viewBox_.lh - kHeaderH - 44) / 2);
-  int cols = landscape_ ? std::max(1, std::min(3, (lw - 2 * m + gap) / (48 + gap))) : 4;
-  if (!landscape_ && lw < 4 * 48 + 2 * m + 3 * gap) cols = 3;
-  const int cw = (lw - 2 * m - (cols - 1) * gap) / cols;
-  auto put = [&](Item it, int row, int col, int span) {
-    cells_.push_back({it, m + col * (cw + gap), top + row * pitch, cw * span + (span - 1) * gap, kBtnH});
+  const int gap = 4, m = 6, pitch = 24;
+  auto grid = [&](int box, std::initializer_list<std::pair<Item, int>> items, int lw, int maxCols, int top) {
+    int cols = std::max(1, std::min(maxCols, (lw - 2 * m + gap) / (48 + gap)));
+    const int cw = (lw - 2 * m - (cols - 1) * gap) / cols;
+    int row = 0, col = 0;
+    for (auto& it : items) {
+      const int span = std::min(it.second, cols);
+      if (col + span > cols) { ++row; col = 0; }
+      cells_.push_back({it.first, box, m + col * (cw + gap), top + row * pitch, cw * span + (span - 1) * gap, kBtnH});
+      col += span;
+      if (col >= cols) { ++row; col = 0; }
+    }
   };
-  if (!landscape_ && cols == 4) {
-    put(kKbd, 0, 0, 1); put(kInfo, 0, 1, 1); put(kPanic, 0, 2, 1); put(kMidi, 0, 3, 1);
-    put(kOctDown, 1, 0, 1); put(kOctLcd, 1, 1, 1); put(kOctUp, 1, 2, 1);
-  } else if (cols >= 3) {
-    put(kKbd, 0, 0, 1); put(kInfo, 0, 1, 1); put(kPanic, 0, 2, 1);
-    put(kOctDown, 1, 0, 1); put(kOctLcd, 1, 1, 1); put(kOctUp, 1, 2, 1);
-    put(kMidi, 2, 0, cols >= 3 ? 3 : 1);
-  } else if (cols == 2) {
-    put(kKbd, 0, 0, 1); put(kInfo, 0, 1, 1); put(kPanic, 1, 0, 1); put(kMidi, 1, 1, 1);
-    put(kOctDown, 2, 0, 1); put(kOctUp, 2, 1, 1); put(kOctLcd, 3, 0, 2);
+  const int top = kHeaderH + 6;
+  if (landscape_) {
+    grid(1, {{kKbd, 1}, {kInfo, 1}, {kPanic, 1}}, boxR_.lw, 3, top);
+    grid(0, {{kOctDown, 1}, {kOctLcd, 1}, {kOctUp, 1}, {kMidi, 3}}, boxL_.lw, 3, top);
   } else {
-    int r = 0;
-    for (Item it : {kKbd, kInfo, kPanic, kOctDown, kOctLcd, kOctUp, kMidi}) put(it, r++, 0, 1);
+    const int stripTop = kHeaderH + std::max(4, (boxR_.lh - kHeaderH - 44) / 2);
+    grid(1, {{kKbd, 1}, {kInfo, 1}, {kPanic, 1}, {kMidi, 1}, {kOctDown, 1}, {kOctLcd, 1}, {kOctUp, 1}}, boxR_.lw, 4, stripTop);
   }
 }
 
 PanelView::Rect PanelView::itemRect(Item i) const {
   for (const Cell& c : cells_)
     if (c.item == i) {
+      const Box& b = c.box == 0 ? boxL_ : boxR_;
       const int k = nativeScale();
-      return {viewBox_.px + c.x * k, viewBox_.py + c.y * k, c.w * k, c.h * k};
+      return {b.px + c.x * k, b.py + c.y * k, c.w * k, c.h * k};
     }
   return {0, 0, 0, 0};
 }
@@ -232,91 +229,63 @@ void PanelView::drawKeycap(Box& b, const Cell& c, const char* label, bool lit, b
 void PanelView::paintBoxes() {
   const uint8_t title[3] = {200, 200, 200};
   const auto& mono = ui::uiFontMonoBold();
-  for (Box* b : {&wheelBox_, &viewBox_}) {
+  for (Box* b : {&boxL_, &boxR_}) {
+    if (b->lw <= 0) continue;
     fillRect(b->buf, b->lw, b->lh, 0, 0, b->lw, b->lh, 60, 60, 60);                 // 1 px line
     fillRect(b->buf, b->lw, b->lh, 1, 1, b->lw - 1, b->lh - 1, 200, 200, 135);      // box fill
     fillRect(b->buf, b->lw, b->lh, 1, 1, b->lw - 1, kHeaderH, 60, 60, 60);          // header bar
+    ui::uiDrawText(b->buf.data(), b->lw, b->lh, 4, 10, b->title, title, mono);
   }
-  ui::uiDrawText(wheelBox_.buf.data(), wheelBox_.lw, wheelBox_.lh, 4, 10, "WHEEL", title, mono);
-  ui::uiDrawText(viewBox_.buf.data(), viewBox_.lw, viewBox_.lh, 4, 10, "VIEW", title, mono);
-  // VIEW items
   for (const Cell& c : cells_) {
+    Box& bx = c.box == 0 ? boxL_ : boxR_;
     bool pressed = false;
     for (auto& kv : btn_) if (kv.second == c.item) pressed = true;
-    if (c.item == kKbd) drawKeycap(viewBox_, c, "KBD", kbVisible_, pressed);
-    else if (c.item == kInfo) drawKeycap(viewBox_, c, "INFO", info_, pressed);
-    else if (c.item == kPanic) drawKeycap(viewBox_, c, "PANIC", false, pressed);
-    else if (c.item == kOctDown) drawKeycap(viewBox_, c, "OCT -", false, pressed);
-    else if (c.item == kOctUp) drawKeycap(viewBox_, c, "OCT +", false, pressed);
+    if (c.item == kKbd) drawKeycap(bx, c, "KBD", kbVisible_, pressed);
+    else if (c.item == kInfo) drawKeycap(bx, c, "INFO", info_, pressed);
+    else if (c.item == kPanic) drawKeycap(bx, c, "PANIC", false, pressed);
+    else if (c.item == kOctDown) drawKeycap(bx, c, "OCT -", false, pressed);
+    else if (c.item == kOctUp) drawKeycap(bx, c, "OCT +", false, pressed);
     else if (c.item == kOctLcd) {   // classic teal LCD: black window, teal rim, teal text
-      fillRect(viewBox_.buf, viewBox_.lw, viewBox_.lh, c.x, c.y, c.x + c.w, c.y + c.h, 0, 86, 75);
-      fillRect(viewBox_.buf, viewBox_.lw, viewBox_.lh, c.x + 1, c.y + 1, c.x + c.w - 1, c.y + c.h - 1, 0, 0, 0);
+      fillRect(bx.buf, bx.lw, bx.lh, c.x, c.y, c.x + c.w, c.y + c.h, 0, 86, 75);
+      fillRect(bx.buf, bx.lw, bx.lh, c.x + 1, c.y + 1, c.x + c.w - 1, c.y + c.h - 1, 0, 0, 0);
       char buf[16];
       std::snprintf(buf, sizeof buf, "C%d", kbLow_ / 12 - 1 + oct_.octave());
       const uint8_t teal[3] = {0, 210, 185};
       const int tw = ui::uiTextWidth(mono, buf);
-      ui::uiDrawText(viewBox_.buf.data(), viewBox_.lw, viewBox_.lh, c.x + (c.w - tw) / 2, c.y + c.h / 2 + 4, buf, teal, mono);
+      ui::uiDrawText(bx.buf.data(), bx.lw, bx.lh, c.x + (c.w - tw) / 2, c.y + c.h / 2 + 4, buf, teal, mono);
     } else if (c.item == kMidi) {    // MIDI-in lamp (classic green LED)
       const uint8_t dark[3] = {60, 60, 60};
-      ui::uiDrawText(viewBox_.buf.data(), viewBox_.lw, viewBox_.lh, c.x + 2, c.y + c.h / 2 + 4, "MIDI", dark, mono);
+      ui::uiDrawText(bx.buf.data(), bx.lw, bx.lh, c.x + 2, c.y + c.h / 2 + 4, "MIDI", dark, mono);
       const int lx = c.x + 2 + ui::uiTextWidth(mono, "MIDI") + 8, ly = c.y + c.h / 2;
       for (int dy = -4; dy <= 4; ++dy)
         for (int dx = -4; dx <= 4; ++dx) {
           const int d2 = dx * dx + dy * dy;
           if (d2 > 20) continue;
-          if (d2 > 14) fillRect(viewBox_.buf, viewBox_.lw, viewBox_.lh, lx + dx, ly + dy, lx + dx + 1, ly + dy + 1, 60, 60, 60);
-          else if (midiLamp_) fillRect(viewBox_.buf, viewBox_.lw, viewBox_.lh, lx + dx, ly + dy, lx + dx + 1, ly + dy + 1, 40, 255, 40);
-          else fillRect(viewBox_.buf, viewBox_.lw, viewBox_.lh, lx + dx, ly + dy, lx + dx + 1, ly + dy + 1, 0, 72, 0);
+          if (d2 > 14) fillRect(bx.buf, bx.lw, bx.lh, lx + dx, ly + dy, lx + dx + 1, ly + dy + 1, 60, 60, 60);
+          else if (midiLamp_) fillRect(bx.buf, bx.lw, bx.lh, lx + dx, ly + dy, lx + dx + 1, ly + dy + 1, 40, 255, 40);
+          else fillRect(bx.buf, bx.lw, bx.lh, lx + dx, ly + dy, lx + dx + 1, ly + dy + 1, 0, 72, 0);
         }
     }
   }
 }
 
-void PanelView::paintBelow() {
-  const int W = kbLogicalW_, H = kbLogicalH_;
-  belowFrame_.assign((size_t)W * H * 4, 255);
-  if (kbVisible_) {
-    std::set<int> lit;
-    for (int n : kb_->activeNotes()) lit.insert(n);
-    kb_->render(W, H, lit, -1, belowFrame_.data());
-  } else {
-    fillRect(belowFrame_, W, H, 0, 0, W, H, 200, 200, 135);
-  }
-}
-
-void PanelView::composePanel(std::vector<uint8_t>& rgba) {
-  rgba.assign((size_t)panelW() * panelH() * 4, 0);
-  panel_->render(rgba.data());
-}
-
-void PanelView::blit(uint8_t* dst, int dw, int dh, int rowBytes) {
-  composePanel(frame_);
-  for (int y = 0; y < dh; ++y) {
-    uint32_t* row = reinterpret_cast<uint32_t*>(dst + (size_t)y * rowBytes);
-    for (int x = 0; x < dw; ++x) row[x] = kClear;
-  }
+// Keyboard overlay: opaque classic-khaki bar with a dark top edge, wheels at the left end, keys.
+void PanelView::drawOverlay(uint8_t* dst, int dw, int dh, int rowBytes) {
   const int k = nativeScale();
-  replicate(dst, dw, dh, rowBytes, frame_.data(), panelW(), panelH(), panelR_.x, panelR_.y, mult_);
-  paintBoxes();
-  replicate(dst, dw, dh, rowBytes, wheelBox_.buf.data(), wheelBox_.lw, wheelBox_.lh, wheelBox_.px, wheelBox_.py, k);
-  replicate(dst, dw, dh, rowBytes, viewBox_.buf.data(), viewBox_.lw, viewBox_.lh, viewBox_.px, viewBox_.py, k);
-  if (belowR_.h > 0) {
-    paintBelow();
-    replicate(dst, dw, dh, rowBytes, belowFrame_.data(), kbLogicalW_, kbLogicalH_, belowR_.x, belowR_.y, k);
-    // the replicated frame can overhang the surface by < k px (clipped); nothing below belowR_ + h
+  for (int y = ovR_.y; y < std::min(dh, ovR_.y + ovR_.h); ++y) {
+    if (y < 0) continue;
+    uint32_t* row = reinterpret_cast<uint32_t*>(dst + (size_t)y * rowBytes);
+    const uint32_t c = y < ovR_.y + ovBorder_ ? 0xFF3C3C3Cu : kClear;   // (60,60,60) top edge
+    for (int x = std::max(0, ovR_.x); x < std::min(dw, ovR_.x + ovR_.w); ++x) row[x] = c;
   }
+  keysFrame_.assign((size_t)kbLogicalW_ * kbLogicalH_ * 4, 255);
+  std::set<int> lit;
+  for (int n : kb_->activeNotes()) lit.insert(n);
+  kb_->render(kbLogicalW_, kbLogicalH_, lit, -1, keysFrame_.data());
+  // clip the replicated keys to the keys rect (they can overhang by < k px)
+  const int ow = std::min(dw, keysR_.x + keysR_.w), oh = std::min(dh, keysR_.y + keysR_.h);
+  replicate(dst, ow, oh, rowBytes, keysFrame_.data(), kbLogicalW_, kbLogicalH_, keysR_.x, keysR_.y, k);
   drawWheels(dst, dw, dh, rowBytes);
-  drawInfo(dst, dw, dh, rowBytes);
-  if (panel_->selectOpen()) {
-    const int cw = panel_->selectClientWidth(), ch = panel_->selectClientHeight(), W = cw + 2, H = ch + 2;
-    const auto fc = panel_->selectFrameColor();
-    std::vector<uint8_t> sel((size_t)W * H * 4, 0);
-    for (size_t i = 0; i < sel.size(); i += 4) { sel[i] = (uint8_t)fc[0]; sel[i + 1] = (uint8_t)fc[1]; sel[i + 2] = (uint8_t)fc[2]; }
-    const auto& cl = panel_->selectClient();
-    for (int y = 0; y < ch; ++y) std::memcpy(&sel[((size_t)(y + 1) * W + 1) * 4], &cl[(size_t)y * cw * 4], (size_t)cw * 4);
-    const Rect r = selectRect();
-    replicate(dst, dw, dh, rowBytes, sel.data(), W, H, r.x, r.y, selScale_);
-  }
 }
 
 // Wheels at native device resolution: dark well with ribs, light ribbed cap (classic palette of the
@@ -373,7 +342,7 @@ void PanelView::drawInfo(uint8_t* dst, int dw, int dh, int rowBytes) {
   int tw = 0;
   for (auto& l : lines) tw = std::max(tw, ui::uiTextWidth(f, l));
   const int pad = px / 2, lh = px * 5 / 4;
-  Rect a = belowR_;
+  Rect a = ovR_;
   const int bw = std::min(a.w - 2 * pad, tw + 2 * pad), bh = std::min(a.h - 2 * pad, (int)lines.size() * lh + pad);
   if (bw <= 0 || bh <= 0) return;
   const int bx = a.x + pad, by = a.y + pad;
@@ -412,6 +381,36 @@ void PanelView::setWheelFromY(int wheel, float sy) {
   }
 }
 
+void PanelView::composePanel(std::vector<uint8_t>& rgba) {
+  rgba.assign((size_t)panelW() * panelH() * 4, 0);
+  panel_->render(rgba.data());
+}
+
+void PanelView::blit(uint8_t* dst, int dw, int dh, int rowBytes) {
+  composePanel(frame_);
+  for (int y = 0; y < dh; ++y) {
+    uint32_t* row = reinterpret_cast<uint32_t*>(dst + (size_t)y * rowBytes);
+    for (int x = 0; x < dw; ++x) row[x] = kClear;
+  }
+  const int k = nativeScale();
+  paintBoxes();
+  if (boxL_.lw > 0) replicate(dst, dw, dh, rowBytes, boxL_.buf.data(), boxL_.lw, boxL_.lh, boxL_.px, boxL_.py, k);
+  replicate(dst, dw, dh, rowBytes, boxR_.buf.data(), boxR_.lw, boxR_.lh, boxR_.px, boxR_.py, k);
+  replicate(dst, dw, dh, rowBytes, frame_.data(), panelW(), panelH(), panelR_.x, panelR_.y, mult_);
+  if (kbVisible_) drawOverlay(dst, dw, dh, rowBytes);
+  drawInfo(dst, dw, dh, rowBytes);
+  if (panel_->selectOpen()) {
+    const int cw = panel_->selectClientWidth(), ch = panel_->selectClientHeight(), W = cw + 2, H = ch + 2;
+    const auto fc = panel_->selectFrameColor();
+    std::vector<uint8_t> sel((size_t)W * H * 4, 0);
+    for (size_t i = 0; i < sel.size(); i += 4) { sel[i] = (uint8_t)fc[0]; sel[i + 1] = (uint8_t)fc[1]; sel[i + 2] = (uint8_t)fc[2]; }
+    const auto& cl = panel_->selectClient();
+    for (int y = 0; y < ch; ++y) std::memcpy(&sel[((size_t)(y + 1) * W + 1) * 4], &cl[(size_t)y * cw * 4], (size_t)cw * 4);
+    const Rect r = selectRect();
+    replicate(dst, dw, dh, rowBytes, sel.data(), W, H, r.x, r.y, selScale_);
+  }
+}
+
 PanelView::Rect PanelView::selectRect() const {
   const int w = (panel_->selectClientWidth() + 2) * selScale_, h = (panel_->selectClientHeight() + 2) * selScale_;
   int x = panelR_.x + panelR_.w / 2 - w / 2, y = panelR_.y + panelR_.h / 2 - h / 2;
@@ -435,12 +434,12 @@ void PanelView::releaseAll() {
 
 void PanelView::doItem(Item it) {
   switch (it) {
-    case kKbd: kbVisible_ = !kbVisible_; needRebuild_ = true; break;
+    case kKbd: kbVisible_ = !kbVisible_; break;          // overlay only: panel scale/position unchanged
     case kInfo: info_ = !info_; break;
     case kOctDown: oct_.step(-1); break;
     case kOctUp: oct_.step(+1); break;
     case kPanic:
-      kb_->allNotesOff();                                   // releases the touched keys (note-off events)
+      kb_->allNotesOff();
       for (int n : oct_.releaseAll()) if (onNoteOff) onNoteOff(n);
       if (onAllNotesOff) onAllNotesOff();
       break;
@@ -463,14 +462,16 @@ void PanelView::pointer(int action, int id, float sx, float sy, long long t) {
       bool hit = false;
       for (Item it : {kKbd, kInfo, kPanic, kOctDown, kOctUp})
         if (in(itemRect(it), sx, sy)) { region_[id] = kButton; btn_[id] = it; hit = true; break; }
-      if (!hit && kbVisible_ && in(belowR_, sx, sy)) { region_[id] = kKeys; hit = true; }
-      if (!hit) {
-        for (int i = 0; i < 2 && !hit; ++i) {
+      if (!hit && kbVisible_ && in(ovR_, sx, sy)) {        // the overlay swallows its whole area
+        hit = true;
+        region_[id] = kSink;
+        for (int i = 0; i < 2; ++i) {
           const Rect r = wheelRc_[i];
           if (sx >= r.x - r.w * 0.25f && sx < r.x + r.w * 1.25f && sy >= r.y && sy < r.y + r.h) {
-            region_[id] = kWheel; heldWheel_[id] = i; activeWheel_ = i; hit = true;
+            region_[id] = kWheel; heldWheel_[id] = i; activeWheel_ = i;
           }
         }
+        if (region_[id] == kSink && in(keysR_, sx, sy)) region_[id] = kKeys;
       }
       if (!hit && inside) region_[id] = kPanel;
     }
@@ -497,7 +498,7 @@ void PanelView::pointer(int action, int id, float sx, float sy, long long t) {
       break;
     }
     case kKeys: {
-      const double kx = (sx - belowR_.x) / (double)k, ky = (sy - belowR_.y) / (double)k;
+      const double kx = (sx - keysR_.x) / (double)k, ky = (sy - keysR_.y) / (double)k;
       if (action == 0) kb_->press(id, kx, ky);
       else if (action == 1) kb_->move(id, kx, ky);
       else kb_->release(id);
@@ -526,7 +527,6 @@ void PanelView::pointer(int action, int id, float sx, float sy, long long t) {
     default: break;
   }
   if (action == 2) region_.erase(id);
-  if (needRebuild_) { std::string e; needRebuild_ = false; rebuild(e); }
 }
 
 }  // namespace synth1_android

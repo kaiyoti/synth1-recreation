@@ -143,7 +143,7 @@ static void tapItem(PanelView& v, PanelView::Item it, int id, long long t) {
   tapAt(v, id, r.x + r.w / 2.f, r.y + r.h / 2.f, t);
 }
 static bool keyPos(PanelView& v, int note, float& sx, float& sy) {
-  const auto kr = v.keyboardRect();
+  const auto kr = v.keysRect();
   auto& kb = v.keyboard();
   const int k = v.nativeScale();
   for (double x = 0; x < kb.width; x += 0.5) {
@@ -154,7 +154,7 @@ static bool keyPos(PanelView& v, int note, float& sx, float& sy) {
 }
 
 static void testWiring(const std::string& root) {
-  printf("Shell wiring (keyboard, OCT+/-, PANIC, INFO, wheels in the WHEEL column)\n");
+  printf("Shell wiring (keyboard overlay, OCT+/-, PANIC, INFO, wheels at the overlay's left end)\n");
   PanelView v; std::string err;
   CHECK(v.init(root + "/classic", 2400, 1080, err, true, 420.f));
   CHECK(v.landscape() && v.octaves() == 3 && v.whiteKeys() == 22);
@@ -219,10 +219,10 @@ static void testWiring(const std::string& root) {
   CHECK(offs == 2 && panics == 1);
   v.pointer(3, 0, 0, 0, 4200);
   // INFO toggles the overlay flag, nothing else changes
-  const auto kr0 = v.keyboardRect();
+  const auto kr0 = v.overlayRect();
   CHECK(!v.infoVisible());
   tapItem(v, PanelView::kInfo, 15, 5000);
-  CHECK(v.infoVisible() && v.keyboardVisible() && v.keyboardRect().h == kr0.h && v.nativeScale() == k);
+  CHECK(v.infoVisible() && v.keyboardVisible() && v.overlayRect().h == kr0.h && v.nativeScale() == k);
   tapItem(v, PanelView::kInfo, 15, 5100);
   CHECK(!v.infoVisible());
   // cancel releases everything
@@ -245,50 +245,72 @@ static void testWiring(const std::string& root) {
 }
 
 static void testPane(const std::string& root, bool portrait) {
-  printf("KBD toggle / relayout (%s)\n", portrait ? "portrait 1080x2400" : "landscape 2400x1080");
+  printf("KBD overlay toggle (%s)\n", portrait ? "portrait 1080x2400" : "landscape 2400x1080");
   PanelView v; std::string err;
   const int W = portrait ? 1080 : 2400, H = portrait ? 2400 : 1080;
   CHECK(v.init(root + "/classic", W, H, err, true, 420.f));
-  CHECK(v.landscape() == !portrait);
+  CHECK(v.landscape() == !portrait && v.keyboardOverlaysPanel() == !portrait);
   int rebuilt = 0;
   v.onRebuilt = [&]() { ++rebuilt; };
   std::vector<std::string> ev;
   v.onNoteOn = [&](int n, int) { ev.push_back("on " + std::to_string(n)); };
   v.onNoteOff = [&](int n) { ev.push_back("off " + std::to_string(n)); };
   const int k0 = v.nativeScale();
+  const auto pr0 = v.panelRect();
+  CHECK(portrait ? k0 == 2 : k0 == 3);
   v.panel().loadProgram(5, 3);
   v.panel().setParam(10, 33);
   const int p10 = v.panel().getParam(10);
   auto pr = v.panelRect();
-  const auto vb = v.viewBoxRect();
-  tapAt(v, 1, pr.x + 21.f * k0, pr.y + 107.f * k0, 10);                   // panel tap
-  tapAt(v, 2, vb.x + 8.f * k0, vb.y + 4.f * k0, 20);                      // VIEW header bar
-  tapAt(v, 3, vb.x + vb.w - 2.f * k0, vb.y + vb.h - 2.f * k0, 30);        // empty corner
-  tapAt(v, 4, v.itemRect(PanelView::kMidi).x + 3.f, v.itemRect(PanelView::kMidi).y + 3.f, 35);   // MIDI lamp (not a button)
-  CHECK(v.keyboardVisible() && rebuilt == 0 && v.nativeScale() == k0);
-  const auto b1 = v.itemRect(PanelView::kKbd);
-  CHECK(b1.w > 0 && b1.x >= vb.x && b1.x + b1.w <= vb.x + vb.w && b1.y + b1.h <= vb.y + vb.h);
-  v.pointer(0, 5, b1.x + 5.f, b1.y + 5.f, 40); v.pointer(2, 5, pr.x + 10.f, pr.y + 10.f, 80);   // lift outside: no toggle
+  const auto ov = v.overlayRect();
+  // buttons are all clear of the overlay and inside the surface (KBD always reachable)
+  for (int i = 0; i < PanelView::kItemCount; ++i) {
+    const auto b = v.itemRect((PanelView::Item)i);
+    CHECK(b.w > 0 && b.x >= 0 && b.y >= 0 && b.x + b.w <= W && b.y + b.h <= H &&
+          !(b.x < ov.x + ov.w && ov.x < b.x + b.w && b.y < ov.y + ov.h && ov.y < b.y + b.h));
+  }
+  // panel tap above the overlay (LED 21 toggles param 4) works with the keyboard shown
+  const int led0 = v.panel().getParam(4);
+  tapAt(v, 1, pr.x + 21.f * k0, pr.y + 107.f * k0, 10);
+  CHECK(v.panel().getParam(4) != led0);
+  tapAt(v, 1, pr.x + 21.f * k0, pr.y + 107.f * k0, 60);                 // and back
+  CHECK(v.panel().getParam(4) == led0);
+  // a tap inside the overlay area where the panel's program LCD is does NOT reach the panel (landscape overlay)
+  if (!portrait) {
+    tapAt(v, 2, pr.x + 167.f * k0, pr.y + 307.f * k0, 100);
+    CHECK(!v.panel().selectOpen());
+    CHECK(!ev.empty());                                                // it played the overlay key instead
+    ev.clear();
+  }
+  tapAt(v, 3, v.rightBoxRect().x + 3.f, v.rightBoxRect().y + 3.f, 120);  // header bar: inert
   CHECK(v.keyboardVisible() && rebuilt == 0);
-  tapItem(v, PanelView::kKbd, 6, 100);                                    // KBD: off
-  CHECK(!v.keyboardVisible() && rebuilt == 1);
-  CHECK(portrait ? v.nativeScale() >= k0 : v.nativeScale() > k0);
-  CHECK(v.keyboardRect().w == 0);
+  const auto b1 = v.itemRect(PanelView::kKbd);
+  v.pointer(0, 5, b1.x + 5.f, b1.y + 5.f, 140); v.pointer(2, 5, pr.x + 10.f, pr.y + 10.f, 180);   // lift outside: no toggle
+  CHECK(v.keyboardVisible());
+  // KBD off: panel scale and position unchanged, no relayout, overlay gone, KBD still tappable
+  tapItem(v, PanelView::kKbd, 6, 200);
+  CHECK(!v.keyboardVisible() && rebuilt == 0 && v.nativeScale() == k0);
+  CHECK(v.panelRect().x == pr0.x && v.panelRect().y == pr0.y && v.panelRect().w == pr0.w);
   CHECK(v.panel().currentBank() == 5 && v.panel().currentProgram() == 3 && v.panel().getParam(10) == p10);
-  printf("  k %d -> %d with the keyboard hidden\n", k0, v.nativeScale());
-  const int k1 = v.nativeScale();
-  tapAt(v, 7, v.panelRect().x + 21.f * k1, v.panelRect().y + 107.f * k1, 200);
-  tapAt(v, 8, W / 2.f, H - 5.f, 210);                                     // where the keyboard was: nothing
-  CHECK(!v.keyboardVisible() && ev.empty() && rebuilt == 1);
-  tapItem(v, PanelView::kKbd, 9, 300);                                    // KBD: on again
-  CHECK(v.keyboardVisible() && rebuilt == 2 && v.nativeScale() == k0);
-  CHECK(v.panel().currentBank() == 5 && v.panel().getParam(10) == p10);
+  tapAt(v, 7, W / 2.f, H - 5.f, 300);                                    // where the keyboard was: nothing plays
+  CHECK(ev.empty());
+  if (!portrait) {                                                       // the panel's bottom (LCD) is reachable now
+    tapAt(v, 8, pr.x + 167.f * k0, pr.y + 307.f * k0, 400);
+    CHECK(v.panel().selectOpen());
+    v.panel().selectDeactivate();
+  }
+  // KBD on again: keyboard + multitouch knob drag + key
+  tapItem(v, PanelView::kKbd, 9, 500);
+  CHECK(v.keyboardVisible() && rebuilt == 0 && v.nativeScale() == k0);
   float xa, ya, xb, yb;
   CHECK(keyPos(v, 60, xa, ya) && keyPos(v, 64, xb, yb));
-  v.pointer(0, 11, xa, ya, 400); v.pointer(0, 12, xb, yb, 401);
+  v.pointer(0, 11, xa, ya, 600); v.pointer(0, 12, xb, yb, 601);
   CHECK(ev.size() == 2 && ev[0] == "on 60" && ev[1] == "on 64");
-  v.pointer(2, 11, xa, ya, 402); v.pointer(2, 12, xb, yb, 403);
-  CHECK(ev.size() == 4 && ev[2] == "off 60" && ev[3] == "off 64");
+  v.pointer(0, 13, pr.x + 91.f * k0, pr.y + 50.f * k0, 602);             // knob drag (panel above the overlay) with keys held
+  CHECK(v.panel().activePointerCount() == 1);
+  v.pointer(2, 13, pr.x + 91.f * k0, pr.y + 50.f * k0, 700);
+  v.pointer(2, 11, xa, ya, 702); v.pointer(2, 12, xb, yb, 703);
+  CHECK(ev.size() == 4 && ev[2] == "off 60" && ev[3] == "off 64" && v.panel().activePointerCount() == 0);
 }
 
 int main(int argc, char** argv) {

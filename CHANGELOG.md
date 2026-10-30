@@ -1,5 +1,14 @@
 # Changelog
 
+## Android 1.0.2 — 2026-10-30 (pre-release)
+- The synth panel now fills the screen: it uses the largest whole-number scale that fits the full
+  height (3× on a 2400×1080 phone, 1.5× the size of 1.0.1).
+- The keyboard (with the pitch and mod wheels) is an overlay over the bottom of the screen;
+  KBD shows or hides it without moving or shrinking the panel. In portrait, where there is room,
+  it sits below the panel instead.
+- KBD, INFO and PANIC (right) and OCT − / octave / OCT + and the MIDI lamp (left) stay visible
+  above the keyboard at all times.
+
 ## Android 1.0.1 — 2026-10-30 (pre-release)
 Layout rework after the first test on a phone ("poor use of space").
 

@@ -28,9 +28,9 @@ Computer keyboard: Z..M / Q..P rows play notes, `-` / `=` (or the octave buttons
 ## Android
 Download the APK from [Releases](https://github.com/kaiyoti/synth1-recreation/releases) and install it (allow installs from unknown
 sources). Android 8.0+ (arm64 or x86_64); USB MIDI input needs Android 10+. Classic skin and the same
-banks as the web edition: the panel at the largest whole-number scale that fits, side columns
-with the pitch/mod wheels and the view buttons (keyboard on/off, octave, panic, MIDI lamp), and a
-full-width keyboard sized to your screen (about 3 octaves on a phone).
+banks as the web edition: the panel fills the screen at the largest whole-number scale, side
+columns hold the always-visible buttons (KBD, octave, panic, info, MIDI lamp), and KBD slides a
+keyboard with pitch/mod wheels over the bottom of the screen (about 3 octaves on a phone).
 
 Build it yourself (JDK 17+, Android SDK with platform 35, build-tools 35.0.0, NDK 27.2.12479018,
 CMake 3.22.1):
